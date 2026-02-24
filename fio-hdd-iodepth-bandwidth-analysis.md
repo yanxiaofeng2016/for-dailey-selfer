@@ -299,21 +299,69 @@ done
 
 ---
 
-## 七、总结
+## 七、实测验证结果
+
+### 验证一：bs=1M + iodepth=32 → 均衡 ✅
+
+```
+参数: --bs=1M --iodepth=32
+结果: 所有 36 块盘带宽均匀，约 224-232 MB/s，差异 < 8 MB/s
+```
+
+iostat 数据：
+
+```
+所有盘统一表现:
+  r/s     ≈ 231        (一致)
+  rMB/s   ≈ 224-232    (差异 <4%)
+  rrqm/s  = 0          (无需合并，单请求已是 1MB)
+  rareq-sz ≈ 888-1024 KB
+  r_await ≈ 138-142 ms
+  aqu-sz  ≈ 31-37
+  %util   = 100%
+```
+
+**结论：bs=1M 时每个请求本身已足够大，完全不依赖 blk-mq 的合并机制，因此 HW Queue 分散问题不再影响带宽，完美验证了根因分析。**
+
+### 验证二（建议追加）：bs=64K + taskset 绑核 → 预期均衡
+
+如果你的测试场景必须使用 bs=64K，可以用 taskset 绑核验证：
+
+```bash
+cpu=0
+for dev in /dev/sd{b..z} /dev/sda{a..k}; do
+    taskset -c $cpu fio --ioengine=libaio \
+        --randrepeat=0 --norandommap --thread --direct=1 \
+        --group_reporting --name="test_$(basename $dev)" \
+        --runtime=60 --time_based \
+        --numjobs=1 --iodepth=128 \
+        --filename=$dev --rw=read --bs=64K &
+    cpu=$((cpu + 1))
+done
+wait
+```
+
+预期：绑核后 64K 请求也能正常合并，所有盘带宽趋于一致（~270 MB/s）。
+
+---
+
+## 八、总结
 
 ```
 问题本质:
-  fio 线程在 120 个 CPU 核心间迁移
-    → 64K 请求分散到不同的 blk-mq 硬件队列
+  mpt3sas 驱动创建了 120 个 blk-mq 硬件队列 (nr_hw_queues=120)
+  fio 线程在 CPU 核心间迁移
+    → 64K 请求分散到不同的硬件队列
     → 队列间无法合并请求
-    → 某些盘的请求恰好集中在一个队列 (合并 → 270 MB/s)
-    → 某些盘的请求分散在多个队列 (不合并 → 120 MB/s)
+    → 线程稳定在一个 CPU 的盘: 合并生效 → rrqm/s=4000, rareq-sz=900KB → 270 MB/s
+    → 线程频繁迁移的盘:       合并失效 → rrqm/s=0,    rareq-sz=64KB  → 120 MB/s
 
-证据:
-  高带宽盘: rrqm/s=4000, rareq-sz=900KB  ← 合并生效
-  低带宽盘: rrqm/s=0,    rareq-sz=64KB   ← 合并失效
+验证:
+  bs=1M + iodepth=32 → 所有盘 ~228 MB/s，差异 <4% ✅ (不依赖合并，问题消失)
+  bs=64K + iodepth=128 + cpus_allowed_policy=split → 仍不均衡 ✗ (split 对单进程无效)
 
-解法:
-  为每个 fio 绑定固定 CPU 核心 (taskset -c N fio ...)
-  或 增大 bs 至 1M 以消除对合并的依赖
+解法 (任选其一):
+  1. taskset -c <N> fio ... --bs=64K    ← 绑核，保证合并在同一队列内完成
+  2. fio ... --bs=1M                    ← 增大块，消除对合并的依赖
+  3. 单 fio 进程 + cpus_allowed=N       ← 正确的绑核写法
 ```
