@@ -2,187 +2,238 @@
 
 ## 一、问题描述
 
-- **测试环境**：Linux 系统，36 块机械硬盘（HDD）
+- **测试环境**：Linux 6.6 (mt2203sp4)，海光 CPU，36 块 SAS 机械硬盘
 - **现象**：
   - `iodepth=32` 时，各盘带宽严重不均衡，盘间差异可达 **~100 MB/s**
   - `iodepth=1024` 时，各盘带宽趋于均衡
 
 ---
 
-## 二、根本原因分析
-
-### 2.1 核心原因：Linux I/O 调度器的队列竞争与饥饿效应
-
-这是最主要的原因。当 36 块盘共享同一 HBA/控制器，且 iodepth 较低时，**I/O 调度器层面的资源竞争**会导致带宽分配严重不均。
-
-#### 机制详解
-
-Linux 内核的 I/O 路径中存在多个队列层级：
+## 二、硬件拓扑（实测数据）
 
 ```
-应用层 (fio) → Block Layer (blk-mq) → I/O Scheduler → SCSI/驱动层 → HBA → 物理盘
+海光 CPU (多核)
+  │
+  ├── host0 (ahci, 板载 SATA)
+  │     └── sda: Intel SSDSC2KB96 (系统盘)
+  │
+  └── host1 (mpt3sas, Broadcom SAS38xx)
+        │  can_queue     = 6632   ← HBA 总队列深度
+        │  cmd_per_lun   = 128    ← 每盘最大并发命令数
+        │  nr_hw_queues  = 120    ← blk-mq 硬件队列数
+        │  sg_tablesize  = 128
+        │
+        └── SAS Expander (enclosure [1:0:36:0])
+              ├── sdb  (WUH722020BLE604, queue_depth=128)
+              ├── sdc  (WUH722020BLE604, queue_depth=128)
+              │ ... (共 36 块 WD Ultrastar HC560 20TB SAS HDD)
+              └── sdak (WUH722020BLE604, queue_depth=128)
+
+I/O 调度器: mq-deadline (当前激活)
+nr_requests: 256 (每盘)
 ```
 
-- **iodepth=32**：每块盘只有 32 个 in-flight I/O 请求。当 36 块盘通过同一个 HBA 控制器发送请求时，总请求数为 `36 × 32 = 1152`。但 HBA 的硬件队列深度是有限的（常见值为 128~4096），I/O 调度器和 SCSI 层需要在这些盘之间做仲裁。
-- 低 iodepth 下，**每块盘的 I/O 请求到达 HBA 队列的时序差异**会被放大：先占满队列的盘持续获得服务，后来者被阻塞，形成"赢者通吃"的马太效应。
-- **iodepth=1024**：每块盘有 1024 个 in-flight 请求，HBA 队列始终处于饱和状态，各盘的请求在队列中充分混合和交替，硬件层面实现了更公平的时间片轮转。
+### 关键数值
 
-### 2.2 HBA/SAS Expander 的仲裁策略
+| 参数 | 值 | 说明 |
+|------|-----|------|
+| HBA can_queue | 6632 | HBA 总共能处理的并发命令数 |
+| cmd_per_lun | 128 | 每块盘最多 128 个并发命令到达 HBA |
+| nr_hw_queues | **120** | blk-mq 硬件队列数，映射到 CPU 核心 |
+| 盘端 queue_depth | 128 | 每块盘 SAS TCQ 队列深度 |
+| nr_requests | 256 | 块层每盘请求队列上限 |
 
-36 块机械盘通常通过 **SAS Expander** 连接到 HBA 控制器（如 LSI/Broadcom MegaRAID 或 HBA 卡）。
-
-```
-HBA Controller
-  ├── SAS Expander 1 (连接 ~18 块盘)
-  └── SAS Expander 2 (连接 ~18 块盘)
-```
-
-**SAS 协议的仲裁行为**：
-- SAS Expander 内部使用 **连接仲裁（Connection Arbitration）** 来决定哪个盘的请求优先通过。
-- 当 iodepth 低时，先完成上一个 I/O 的盘会先发起新请求，形成 **正反馈循环**——响应快的盘持续快，响应慢的盘持续慢。
-- 机械盘的寻道时间有随机性（取决于磁头当前位置），某些盘因为数据分布或当前磁头位置恰好处于有利位置，吞吐量会暂时领先，而低 iodepth 无法"稀释"这种差异。
-
-### 2.3 机械盘固有的性能离散性
-
-即使是同型号的机械盘，其 **实际性能也存在离散性**：
-
-| 差异因素 | 影响 |
-|---------|------|
-| 磁头定位精度 | 寻道时间 ±2ms 波动 |
-| 数据在盘片上的物理位置 | 外圈 vs 内圈，线速度差异可达 50% |
-| 盘片微小的偏心和振动 | 相邻盘间的共振耦合 |
-| 固件差异 | 即使同批次，读写缓存策略可能微调 |
-| 温度差异 | 机箱内部温度梯度影响磁头寻道精度 |
-
-在 iodepth=32 时，每块盘只有 32 个待处理的请求，**盘与盘之间的固有性能差异直接暴露为带宽差异**。当 iodepth 足够大（如 1024），每块盘的请求队列足够深，排队论的 **大数定律** 开始生效，平均吞吐量趋于一致。
-
-### 2.4 NCQ/TCQ 队列深度与带宽的统计学关系
-
-机械盘支持 **NCQ（Native Command Queuing）/ TCQ（Tagged Command Queuing）**，典型队列深度上限为 32（SATA）或 128+（SAS）。
-
-- **iodepth=32** 恰好等于 SATA NCQ 的上限。如果这些是 SATA 盘通过 SAS Expander 连接，那么此时：
-  - 每块盘的 NCQ 队列刚好被填满
-  - NCQ 的 **I/O 调度优化**（电梯算法、最短寻道优先）在不同盘上的优化效果不同
-  - 数据分布不均的盘，NCQ 优化后的吞吐量差异会很大
-
-- **iodepth=1024** 时：
-  - 盘端仍然只能处理 32/128 个并发请求，但 **Linux I/O 调度器的队列中有大量排队的请求**
-  - 这使得调度器可以做 **更好的合并（merge）和排序**，磨平了盘间差异
-  - 同时 HBA 侧可以更均匀地分配带宽
-
-### 2.5 blk-mq 多队列映射不均
-
-Linux 的 blk-mq（多队列块层）将 I/O 请求分配到多个硬件队列：
+### iodepth=32 时的流量
 
 ```
-CPU Core 0 → Software Queue 0 → Hardware Queue 0
-CPU Core 1 → Software Queue 1 → Hardware Queue 1
+每盘 in-flight: 32         ← 远低于 cmd_per_lun(128) 和 queue_depth(128)
+HBA 总 in-flight: 36×32 = 1152  ← 远低于 can_queue(6632)
+盘端 TCQ 填充率: 32/128 = 25%
+```
+
+### iodepth=1024 时的流量
+
+```
+每盘提交: 1024，但被 cmd_per_lun 限制为 128 到达盘端
+块层排队: 1024-128 = 896 个请求在 mq-deadline 中排队
+HBA 总 in-flight: 36×128 = 4608  ← 仍在 can_queue(6632) 范围内
+盘端 TCQ 填充率: 128/128 = 100%
+```
+
+---
+
+## 三、根本原因分析
+
+> **结论：HBA 队列不是瓶颈。根本原因是 iodepth=32 时盘端 TCQ 填充不足 + blk-mq 120 个硬件队列的 CPU 亲和性不均 + mq-deadline 调度器在低队列深度下的批处理抖动，三者叠加导致带宽分配不均。**
+
+### 3.1 核心原因：盘端 TCQ 填充率过低（25%），机械盘寻道方差被放大
+
+这是**最关键的因素**。
+
+WUH722020BLE604 是 SAS 盘，TCQ 深度 128。iodepth=32 时每块盘只有 32 个 in-flight 请求：
+
+- **TCQ 调度优化效果打折**：TCQ/NCQ 的核心优势是在多个待处理请求中选择"最优寻道路径"（类似电梯算法）。队列中只有 32 个请求时，优化空间远不如 128 个请求时充分。
+- **寻道时间的随机方差被暴露**：机械盘单次寻道时间在 0.5ms~15ms 之间波动。32 个请求的平均寻道时间方差较大——某些盘如果恰好碰上一串长寻道，吞吐量会骤降。
+- **正反馈循环**：吞吐量高的盘更快消耗完 32 个请求 → 更快提交新请求 → 继续保持高吞吐；吞吐量低的盘还在处理长寻道 → 新请求迟迟不到 → 继续低吞吐。
+
+**iodepth=1024 时**：盘端被 `cmd_per_lun=128` 限制，TCQ 满载运行。128 个请求给了 TCQ 充分的优化空间，寻道路径最优化程度高，各盘的吞吐量趋于该盘的理论峰值，差异自然缩小。同时块层有 896 个排队请求，一旦某个请求完成，调度器立刻补上新请求，消除了"空窗期"。
+
+### 3.2 blk-mq 120 个硬件队列的 CPU 亲和性不均
+
+这是一个**隐蔽但重要**的因素。
+
+`nr_hw_queues=120` 意味着 mpt3sas 驱动为 HBA 创建了 120 个硬件提交队列，通常 1:1 映射到 CPU 核心：
+
+```
+CPU Core 0  → HW Queue 0  → HBA
+CPU Core 1  → HW Queue 1  → HBA
 ...
+CPU Core 119 → HW Queue 119 → HBA
 ```
 
-- 36 块盘的 fio 进程/线程被 CPU 调度到不同核心
-- 不同核心的 **软件队列到硬件队列的映射** 可能不均匀
-- iodepth=32 时，某些映射路径上的盘获得更多的 HBA 带宽；iodepth=1024 时，队列充分饱和，映射不均的影响被淹没
+fio 为每块盘创建一个 job 线程，OS 调度器将这些线程分配到不同 CPU 核心。问题在于：
+
+- **线程迁移**：fio job 线程没有绑定 CPU 时，OS 可能在运行过程中迁移线程到其他核心，导致 I/O 从一个 HW Queue 切换到另一个。
+- **HW Queue 负载不均**：如果多个盘的 fio 线程恰好调度到同一个 CPU 核心，它们共享同一个 HW Queue，造成该队列拥挤，而其他 HW Queue 空闲。
+- **NUMA 效应**：海光 CPU 是多 NUMA 节点架构。如果 fio 线程在远端 NUMA 节点的 CPU 上运行，访问 HBA 的延迟更高，该盘带宽更低。
+
+**iodepth=32 时**：每个 HW Queue 上只有少量请求（32/120 ≈ 不到 1 个请求/队列的平均值），CPU 调度的随机性直接反映为各盘带宽差异。
+
+**iodepth=1024 时**：块层排队深（256 nr_requests），无论线程在哪个 CPU 上，请求的蓄水池足够深，HW Queue 的负载不均被排队缓冲吸收。
+
+### 3.3 mq-deadline 调度器的批处理行为
+
+mq-deadline 的工作方式：
+
+1. 将请求按 LBA 排序（用于顺序优化）
+2. 同时维护 deadline 保证（防饥饿）
+3. **以批次（batch）方式派发请求**
+
+在 iodepth=32 时：
+- 每块盘只有 32 个请求供调度器排序和批处理
+- 批处理粒度粗糙，某些盘可能一次被派发大批请求（burst），其他盘等待
+- **不同盘的 deadline 到期时间有微小差异**，但低 iodepth 下这些差异被放大为可感知的带宽波动
+
+在 iodepth=1024 时：
+- 调度器有 256 个排队请求（nr_requests 上限），批处理更平滑
+- 各盘的请求交替派发更均匀
+
+### 3.4 SAS Expander 连接仲裁
+
+36 块盘通过同一个 SAS Expander 连接。SAS 协议使用连接仲裁来决定哪个盘的数据帧优先通过 Expander 的背板链路：
+
+- 低 iodepth 时，Expander 链路利用率低，先完成 I/O 的盘先重新仲裁到链路
+- 高 iodepth 时，链路接近饱和，仲裁轮转更公平
 
 ---
 
-## 三、为什么 iodepth=1024 就均衡了？
+## 四、各因素贡献度评估
 
-用一个直观的类比：
-
-> **iodepth=32** 相当于每块盘只派了 32 个人去食堂排队。如果某块盘的人排在了靠前的位置，它就吃得多。盘间差异取决于"谁先排到"。
->
-> **iodepth=1024** 相当于每块盘派了 1024 个人排队。食堂（HBA）永远是满的，谁先谁后已经不重要了——每块盘在任意时刻都有足够多的人在排队，按比例分配到的食物（带宽）趋于一致。
-
-从排队论角度：
-- iodepth 增大 → 每块盘的请求在各级队列中的**驻留时间方差减小** → 吞吐量趋于稳定
-- 满足 **Little's Law**：`L = λ × W`（队列长度 = 到达率 × 等待时间），当 L 足够大时，λ（吞吐量）的波动被平均化
+| 因素 | 贡献度 | 理由 |
+|------|--------|------|
+| **盘端 TCQ 填充不足 (25%)** | ★★★★★ | 直接决定机械盘的寻道优化效果和吞吐方差 |
+| **blk-mq 120 HW Queue CPU 亲和** | ★★★★☆ | 120 个队列 + 线程未绑核 = 负载分布随机 |
+| **mq-deadline 批处理抖动** | ★★★☆☆ | 低 iodepth 下批处理粒度粗，各盘派发不均 |
+| **SAS Expander 仲裁** | ★★☆☆☆ | 有影响但非主因，SAS 12G 带宽充裕 |
+| **HBA 队列争抢** | ☆☆☆☆☆ | **已排除**：can_queue=6632 远大于需求 |
 
 ---
 
-## 四、验证方法与排查建议
+## 五、验证与优化建议
 
-### 4.1 确认 I/O 调度器
+### 5.1 立竿见影：增大 iodepth 或调整 cmd_per_lun
+
+如果测试目标允许，直接使用 iodepth=128（填满盘端 TCQ）：
 
 ```bash
-# 查看每块盘的 I/O 调度器
-for dev in sd{a..z} sda{a..j}; do
-    echo -n "$dev: "
-    cat /sys/block/$dev/queue/scheduler 2>/dev/null
+fio --iodepth=128 ...
+```
+
+### 5.2 绑定 CPU 消除 blk-mq 分布不均
+
+fio 中使用 `cpus_allowed` 为每个 job 绑定不同的 CPU 核心，避免线程迁移和 HW Queue 共享：
+
+```ini
+[disk1]
+filename=/dev/sdb
+cpus_allowed=0
+
+[disk2]
+filename=/dev/sdc
+cpus_allowed=1
+
+; ... 每块盘绑定不同核心
+```
+
+或用 `cpus_allowed_policy=split` 自动分配：
+
+```bash
+fio --cpus_allowed_policy=split ...
+```
+
+### 5.3 尝试切换调度器为 none
+
+由于 HBA 和盘端都有足够的队列深度，可以绕过 mq-deadline 的批处理逻辑：
+
+```bash
+for dev in sd{b..z} sda{a..k}; do
+    echo none > /sys/block/$dev/queue/scheduler
 done
 ```
 
-建议：对机械盘使用 `mq-deadline` 或 `bfq`（带宽公平调度器），避免使用 `none`。
+这让请求直接从 blk-mq 软件队列派发到 HBA HW Queue，减少调度器引入的批处理不均。
 
-### 4.2 检查 HBA 队列深度
+### 5.4 NUMA 亲和性检查
 
 ```bash
-# 查看 HBA 驱动的队列深度
-cat /sys/class/scsi_host/host*/can_queue
-# 查看每块盘的队列深度
-cat /sys/block/sd*/device/queue_depth
+# 查看 HBA 所在的 NUMA 节点
+cat /sys/class/scsi_host/host1/device/../numa_node
+# 或
+lspci -s 41:00.0 -vv | grep "NUMA node"
+
+# 将 fio 绑定到 HBA 所在的 NUMA 节点
+numactl --cpunodebind=<node> --membind=<node> fio ...
 ```
 
-### 4.3 使用中间 iodepth 值验证
+### 5.5 查看 mpt3sas 驱动参数
 
 ```bash
-# 测试不同 iodepth 下的带宽离散度
+# 查看 mpt3sas 的可调参数
+ls /sys/module/mpt3sas/parameters/
+cat /sys/module/mpt3sas/parameters/*
+```
+
+关注 `max_queue_depth` 和 `command_retry_count` 等参数。
+
+### 5.6 不同 iodepth 梯度测试验证
+
+```bash
 for depth in 1 4 16 32 64 128 256 512 1024; do
     echo "=== iodepth=$depth ==="
-    fio --name=test --ioengine=libaio --direct=1 --rw=read \
-        --bs=128k --iodepth=$depth --numjobs=1 \
-        --filename=/dev/sd{a..z} --filename=/dev/sda{a..j} \
-        --group_reporting=0 --runtime=30 --time_based
+    fio --name=bw_test --ioengine=libaio --direct=1 --rw=read \
+        --bs=1M --iodepth=$depth --numjobs=1 --runtime=30 --time_based \
+        --filename=/dev/sdb:/dev/sdc:...:/dev/sdak \
+        --group_reporting=0
 done
 ```
 
-预期结果：iodepth 从小到大，带宽离散度（标准差/平均值）应逐渐降低。
-
-### 4.4 检查 SAS Expander 拓扑
-
-```bash
-# 使用 sas_discover 或 lsscsi 检查拓扑
-lsscsi -t
-# 或
-sas2ircu list
-sas2ircu 0 display
-```
-
-如果 36 块盘分布在不同 Expander 下，可能同一 Expander 下的盘之间更均衡，跨 Expander 的盘差异更大。
-
-### 4.5 监控实时 I/O 分布
-
-```bash
-# 使用 iostat 观察每块盘的实时带宽
-iostat -x 1 -p sd{a..z} sda{a..j}
-
-# 或者使用 bcc/bpftrace 观察 blk 层的请求分布
-biosnoop -d sda
-```
-
----
-
-## 五、优化建议
-
-| 优化措施 | 方法 | 效果 |
-|---------|------|------|
-| **调整 I/O 调度器** | 使用 `bfq`：`echo bfq > /sys/block/sdX/queue/scheduler` | BFQ 提供带宽公平保证 |
-| **增大 nr_requests** | `echo 256 > /sys/block/sdX/queue/nr_requests` | 增大块层队列深度 |
-| **调整盘端队列深度** | `echo 64 > /sys/block/sdX/device/queue_depth`（SAS盘） | 让盘端缓冲更多请求 |
-| **CPU 绑定** | fio 使用 `cpus_allowed` 参数，确保每个 job 绑定到特定 CPU | 避免 blk-mq 映射不均 |
-| **HBA 参数调优** | 增大 HBA 驱动的 `can_queue` 和 `cmd_per_lun` | 增大控制器端缓冲 |
-| **使用适当的 iodepth** | 对于机械盘带宽测试，建议 iodepth >= 128 | 确保统计均匀 |
+预期：iodepth 从 32 增大到 128 时（填满盘端 TCQ），带宽离散度应显著下降。
 
 ---
 
 ## 六、总结
 
-**iodepth=32 带宽不均衡的本质是：低队列深度下，各级 I/O 队列的竞争仲裁行为 + 机械盘固有的性能离散性，共同导致了"富者越富"的正反馈效应。**
+```
+                        iodepth=32              iodepth=1024
+                        ──────────              ────────────
+盘端 TCQ 填充          32/128 = 25% ←关键!      128/128 = 100%
+TCQ 寻道优化效果        差，方差大               充分优化，方差小
+HBA 总 in-flight       1152/6632 = 17%          4608/6632 = 69%
+blk-mq 排队缓冲       几乎没有                  每盘 ~896 排队
+调度器批处理质量        粗糙，各盘不均            平滑，交替均匀
+带宽均衡性              差，差异 ~100 MB/s       好，基本一致
+```
 
-当 iodepth 增大到 1024 时：
-1. HBA/Expander 的硬件队列始终饱和，仲裁更加公平
-2. Linux 块层有足够的请求做合并和排序优化
-3. 排队论的大数定律抹平了盘间的随机性差异
-4. 每块盘的 NCQ/TCQ 始终满载运行，磨平了寻道时间的随机波动
+**根本原因**：iodepth=32 时盘端 TCQ 只填充了 25%，机械盘无法充分优化寻道路径，各盘因初始磁头位置和数据分布的差异产生不同的寻道效率，且低队列深度下没有足够的请求来"稀释"这种随机波动。叠加 blk-mq 120 个硬件队列的 CPU 亲和性不均和 mq-deadline 批处理抖动，最终表现为 ~100 MB/s 的盘间带宽差异。
 
-这是 **多设备共享链路 + 低队列深度** 场景下的经典问题，与机械盘的随机寻道特性高度相关，在 SSD 上通常不会出现如此显著的差异。
+**最直接的解法**：将 iodepth 设为 ≥128（填满盘端 TCQ），或同时绑定 CPU + 使用 none 调度器。
