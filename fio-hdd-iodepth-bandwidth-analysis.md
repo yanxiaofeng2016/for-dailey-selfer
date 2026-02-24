@@ -1,239 +1,319 @@
-# FIO 测试 36 块机械盘 iodepth=32 带宽不均衡分析
+# FIO 测试 36 块机械盘带宽不均衡分析
 
 ## 一、问题描述
 
 - **测试环境**：Linux 6.6 (mt2203sp4)，海光 CPU，36 块 SAS 机械硬盘
-- **现象**：
-  - `iodepth=32` 时，各盘带宽严重不均衡，盘间差异可达 **~100 MB/s**
-  - `iodepth=1024` 时，各盘带宽趋于均衡
+- **HBA**：Broadcom SAS38xx (mpt3sas)，`nr_hw_queues=120`
+- **fio 命令**：
+
+```bash
+fio --ioengine=libaio \
+    --randrepeat=0 --norandommap --thread --direct=1 \
+    --group_reporting --runtime=3600 --time_based \
+    --numjobs=1 --iodepth=128 --cpus_allowed_policy=split \
+    --filename=/dev/sdX --rw=read --bs=64K
+```
+
+- **现象**：即使 iodepth=128 + cpus_allowed_policy=split，各盘带宽仍严重不均，差异 ~150 MB/s
 
 ---
 
 ## 二、硬件拓扑（实测数据）
 
 ```
-海光 CPU (多核)
+海光 CPU (多核，多 NUMA 节点)
   │
   ├── host0 (ahci, 板载 SATA)
   │     └── sda: Intel SSDSC2KB96 (系统盘)
   │
   └── host1 (mpt3sas, Broadcom SAS38xx)
-        │  can_queue     = 6632   ← HBA 总队列深度
-        │  cmd_per_lun   = 128    ← 每盘最大并发命令数
-        │  nr_hw_queues  = 120    ← blk-mq 硬件队列数
+        │  can_queue     = 6632
+        │  cmd_per_lun   = 128
+        │  nr_hw_queues  = 120    ← 关键！120 个硬件提交队列
         │  sg_tablesize  = 128
         │
-        └── SAS Expander (enclosure [1:0:36:0])
-              ├── sdb  (WUH722020BLE604, queue_depth=128)
-              ├── sdc  (WUH722020BLE604, queue_depth=128)
-              │ ... (共 36 块 WD Ultrastar HC560 20TB SAS HDD)
-              └── sdak (WUH722020BLE604, queue_depth=128)
-
-I/O 调度器: mq-deadline (当前激活)
-nr_requests: 256 (每盘)
-```
-
-### 关键数值
-
-| 参数 | 值 | 说明 |
-|------|-----|------|
-| HBA can_queue | 6632 | HBA 总共能处理的并发命令数 |
-| cmd_per_lun | 128 | 每块盘最多 128 个并发命令到达 HBA |
-| nr_hw_queues | **120** | blk-mq 硬件队列数，映射到 CPU 核心 |
-| 盘端 queue_depth | 128 | 每块盘 SAS TCQ 队列深度 |
-| nr_requests | 256 | 块层每盘请求队列上限 |
-
-### iodepth=32 时的流量
-
-```
-每盘 in-flight: 32         ← 远低于 cmd_per_lun(128) 和 queue_depth(128)
-HBA 总 in-flight: 36×32 = 1152  ← 远低于 can_queue(6632)
-盘端 TCQ 填充率: 32/128 = 25%
-```
-
-### iodepth=1024 时的流量
-
-```
-每盘提交: 1024，但被 cmd_per_lun 限制为 128 到达盘端
-块层排队: 1024-128 = 896 个请求在 mq-deadline 中排队
-HBA 总 in-flight: 36×128 = 4608  ← 仍在 can_queue(6632) 范围内
-盘端 TCQ 填充率: 128/128 = 100%
+        └── SAS Expander
+              └── 36 × WUH722020BLE604 (queue_depth=128, mq-deadline, nr_requests=256)
 ```
 
 ---
 
-## 三、根本原因分析
+## 三、iostat 数据分析 — 发现决定性证据
 
-> **结论：HBA 队列不是瓶颈。根本原因是 iodepth=32 时盘端 TCQ 填充不足 + blk-mq 120 个硬件队列的 CPU 亲和性不均 + mq-deadline 调度器在低队列深度下的批处理抖动，三者叠加导致带宽分配不均。**
+iostat 数据清晰地将 36 块盘分为两组：
 
-### 3.1 核心原因：盘端 TCQ 填充率过低（25%），机械盘寻道方差被放大
-
-这是**最关键的因素**。
-
-WUH722020BLE604 是 SAS 盘，TCQ 深度 128。iodepth=32 时每块盘只有 32 个 in-flight 请求：
-
-- **TCQ 调度优化效果打折**：TCQ/NCQ 的核心优势是在多个待处理请求中选择"最优寻道路径"（类似电梯算法）。队列中只有 32 个请求时，优化空间远不如 128 个请求时充分。
-- **寻道时间的随机方差被暴露**：机械盘单次寻道时间在 0.5ms~15ms 之间波动。32 个请求的平均寻道时间方差较大——某些盘如果恰好碰上一串长寻道，吞吐量会骤降。
-- **正反馈循环**：吞吐量高的盘更快消耗完 32 个请求 → 更快提交新请求 → 继续保持高吞吐；吞吐量低的盘还在处理长寻道 → 新请求迟迟不到 → 继续低吞吐。
-
-**iodepth=1024 时**：盘端被 `cmd_per_lun=128` 限制，TCQ 满载运行。128 个请求给了 TCQ 充分的优化空间，寻道路径最优化程度高，各盘的吞吐量趋于该盘的理论峰值，差异自然缩小。同时块层有 896 个排队请求，一旦某个请求完成，调度器立刻补上新请求，消除了"空窗期"。
-
-### 3.2 blk-mq 120 个硬件队列的 CPU 亲和性不均
-
-这是一个**隐蔽但重要**的因素。
-
-`nr_hw_queues=120` 意味着 mpt3sas 驱动为 HBA 创建了 120 个硬件提交队列，通常 1:1 映射到 CPU 核心：
+### 高带宽组（~260-277 MB/s）
 
 ```
-CPU Core 0  → HW Queue 0  → HBA
-CPU Core 1  → HW Queue 1  → HBA
+Device    r/s     rMB/s   rrqm/s   rareq-sz   aqu-sz
+sdaa      311     276     4105     ~908 KB     ~9
+sdad      336     268     3964     ~819 KB     ~10
+sdag      329     263     3975     ~817 KB     ~11
+sdai      338     269     3977     ~817 KB     ~11
+sdf       272     272     4046     ~1024 KB    ~8
 ...
-CPU Core 119 → HW Queue 119 → HBA
 ```
 
-fio 为每块盘创建一个 job 线程，OS 调度器将这些线程分配到不同 CPU 核心。问题在于：
+特征：**rrqm/s ≈ 3000-4100**（大量合并），rareq-sz ≈ 800-1024 KB，r/s 低（~300）
 
-- **线程迁移**：fio job 线程没有绑定 CPU 时，OS 可能在运行过程中迁移线程到其他核心，导致 I/O 从一个 HW Queue 切换到另一个。
-- **HW Queue 负载不均**：如果多个盘的 fio 线程恰好调度到同一个 CPU 核心，它们共享同一个 HW Queue，造成该队列拥挤，而其他 HW Queue 空闲。
-- **NUMA 效应**：海光 CPU 是多 NUMA 节点架构。如果 fio 线程在远端 NUMA 节点的 CPU 上运行，访问 HBA 的延迟更高，该盘带宽更低。
+### 低带宽组（~117-130 MB/s）
 
-**iodepth=32 时**：每个 HW Queue 上只有少量请求（32/120 ≈ 不到 1 个请求/队列的平均值），CPU 调度的随机性直接反映为各盘带宽差异。
+```
+Device    r/s     rMB/s   rrqm/s   rareq-sz   aqu-sz
+sdab      1830    121     123      ~68 KB      ~120
+sdae      1838    120     90       ~67 KB      ~128
+sdaj      1867    117     0        ~64 KB      ~128
+sdd       1834    118     44       ~66 KB      ~124
+sdh       1861    118     30       ~65 KB      ~125
+sdr       1871    116     0        ~64 KB      ~128
+...
+```
 
-**iodepth=1024 时**：块层排队深（256 nr_requests），无论线程在哪个 CPU 上，请求的蓄水池足够深，HW Queue 的负载不均被排队缓冲吸收。
+特征：**rrqm/s ≈ 0-123**（几乎不合并），rareq-sz ≈ 64-68 KB，r/s 高（~1800）
 
-### 3.3 mq-deadline 调度器的批处理行为
+### 关键对比
 
-mq-deadline 的工作方式：
-
-1. 将请求按 LBA 排序（用于顺序优化）
-2. 同时维护 deadline 保证（防饥饿）
-3. **以批次（batch）方式派发请求**
-
-在 iodepth=32 时：
-- 每块盘只有 32 个请求供调度器排序和批处理
-- 批处理粒度粗糙，某些盘可能一次被派发大批请求（burst），其他盘等待
-- **不同盘的 deadline 到期时间有微小差异**，但低 iodepth 下这些差异被放大为可感知的带宽波动
-
-在 iodepth=1024 时：
-- 调度器有 256 个排队请求（nr_requests 上限），批处理更平滑
-- 各盘的请求交替派发更均匀
-
-### 3.4 SAS Expander 连接仲裁
-
-36 块盘通过同一个 SAS Expander 连接。SAS 协议使用连接仲裁来决定哪个盘的数据帧优先通过 Expander 的背板链路：
-
-- 低 iodepth 时，Expander 链路利用率低，先完成 I/O 的盘先重新仲裁到链路
-- 高 iodepth 时，链路接近饱和，仲裁轮转更公平
+```
+                高带宽盘             低带宽盘
+                ────────            ────────
+rrqm/s          ~4000               ~0-123       ← 根本差异！
+rareq-sz        ~900 KB             ~64 KB       ← 合并后 vs 未合并
+r/s             ~300                ~1800        ← 少量大请求 vs 大量小请求
+rMB/s           ~270                ~120         ← 带宽差 ~150 MB/s
+aqu-sz          ~9-12               ~120-128     ← 队列不满 vs 队列塞满
+```
 
 ---
 
-## 四、各因素贡献度评估
+## 四、根本原因：blk-mq 多硬件队列导致请求合并失效
 
-| 因素 | 贡献度 | 理由 |
-|------|--------|------|
-| **盘端 TCQ 填充不足 (25%)** | ★★★★★ | 直接决定机械盘的寻道优化效果和吞吐方差 |
-| **blk-mq 120 HW Queue CPU 亲和** | ★★★★☆ | 120 个队列 + 线程未绑核 = 负载分布随机 |
-| **mq-deadline 批处理抖动** | ★★★☆☆ | 低 iodepth 下批处理粒度粗，各盘派发不均 |
-| **SAS Expander 仲裁** | ★★☆☆☆ | 有影响但非主因，SAS 12G 带宽充裕 |
-| **HBA 队列争抢** | ☆☆☆☆☆ | **已排除**：can_queue=6632 远大于需求 |
+### 4.1 核心机制
 
----
+**这不是盘的性能差异，而是 Linux blk-mq 的请求合并（merge）在某些盘上完全失效了。**
 
-## 五、验证与优化建议
+原理：
 
-### 5.1 立竿见影：增大 iodepth 或调整 cmd_per_lun
+```
+fio 线程 (bs=64K, iodepth=128, 顺序读)
+  │
+  │ 连续提交 64K 请求: LBA 0-63, LBA 64-127, LBA 128-191, ...
+  │
+  ├─ 如果线程始终在 CPU 5 上运行:
+  │    所有请求 → HW Queue 5 → 合并成 ~1MB 大请求 → rareq-sz=900KB → 270 MB/s ✓
+  │
+  └─ 如果线程在 CPU 5, 17, 83, 42... 之间迁移:
+       请求分散到多个 HW Queue → 每个队列只有零散的 64K → 无法合并 → rareq-sz=64KB → 120 MB/s ✗
+```
 
-如果测试目标允许，直接使用 iodepth=128（填满盘端 TCQ）：
+**blk-mq 的请求合并只在同一个硬件队列（HW Queue）内进行。**
+
+当 `nr_hw_queues=120` 时，每个 CPU 核心映射到不同的 HW Queue。如果 fio 线程在运行过程中被 OS 调度器迁移到另一个 CPU 核心，后续的请求就进了另一个 HW Queue，与之前的请求无法合并。
+
+### 4.2 为什么 cpus_allowed_policy=split 没有生效？
+
+你的 fio 命令是**每块盘单独一个 fio 进程**：
 
 ```bash
-fio --iodepth=128 ...
+fio ... --numjobs=1 --cpus_allowed_policy=split --filename=/dev/sdX
 ```
 
-### 5.2 绑定 CPU 消除 blk-mq 分布不均
+`cpus_allowed_policy=split` 的含义是：**把 cpus_allowed 指定的 CPU 列表在 numjobs 个 job 之间平分**。
 
-fio 中使用 `cpus_allowed` 为每个 job 绑定不同的 CPU 核心，避免线程迁移和 HW Queue 共享：
+但你没有设置 `cpus_allowed`，而且 `numjobs=1`，所以：
+- 没有 cpus_allowed → 默认所有 CPU 都可用
+- numjobs=1 → 只有一个 job，"split" 1 份 = 全部 CPU 可用
+- **结果：线程仍然可以在所有 CPU 上自由迁移，等于没加这个参数**
+
+### 4.3 为什么 iodepth=1024 反而均衡？
+
+iodepth=1024 时：
+- `cmd_per_lun=128` 限制了每盘最多 128 个请求到达 HBA
+- **剩余 896 个请求在 mq-deadline 调度器的队列中等待**
+- 调度器队列是**全局的**（不按 HW Queue 分），在派发时可以做合并
+- 请求密度足够高，即使分布在多个 HW Queue 中，每个队列内的请求也有相邻 LBA 可以合并
+- 所以所有盘都能获得较好的合并效果
+
+### 4.4 现象的随机性
+
+哪些盘"快"哪些盘"慢"，取决于 fio 进程启动时的 CPU 调度决策和运行时的线程迁移行为——**每次运行结果可能不同**，但总是有部分盘快、部分盘慢。
+
+---
+
+## 五、解决方案
+
+### 方案一（推荐）：为每个 fio 进程绑定固定 CPU
+
+这是最精准的方案。确保每个 fio 线程不会跨 CPU 迁移，所有请求在同一个 HW Queue 中完成合并。
+
+**方法 A：使用 taskset 绑核**
+
+```bash
+cpu=0
+for dev in /dev/sd{b..z} /dev/sda{a..k}; do
+    taskset -c $cpu fio --ioengine=libaio \
+        --randrepeat=0 --norandommap --thread --direct=1 \
+        --group_reporting --name="test_$(basename $dev)" \
+        --runtime=3600 --time_based \
+        --numjobs=1 --iodepth=128 \
+        --filename=$dev --rw=read --bs=64K &
+    cpu=$((cpu + 1))
+done
+wait
+```
+
+**方法 B：使用单个 fio 配置文件 + cpus_allowed**
 
 ```ini
-[disk1]
+; fio_all_disks.fio
+[global]
+ioengine=libaio
+randrepeat=0
+norandommap
+thread
+direct=1
+runtime=3600
+time_based
+numjobs=1
+iodepth=128
+rw=read
+bs=64K
+
+[sdb]
 filename=/dev/sdb
 cpus_allowed=0
 
-[disk2]
+[sdc]
 filename=/dev/sdc
 cpus_allowed=1
 
-; ... 每块盘绑定不同核心
+[sdd]
+filename=/dev/sdd
+cpus_allowed=2
+
+; ... 每块盘分配一个独立 CPU 核心 ...
+
+[sdak]
+filename=/dev/sdak
+cpus_allowed=35
 ```
 
-或用 `cpus_allowed_policy=split` 自动分配：
+然后运行：
 
 ```bash
-fio --cpus_allowed_policy=split ...
+fio fio_all_disks.fio
 ```
 
-### 5.3 尝试切换调度器为 none
+**方法 C：生成配置文件的脚本**
 
-由于 HBA 和盘端都有足够的队列深度，可以绕过 mq-deadline 的批处理逻辑：
+```bash
+#!/bin/bash
+CONFIG="/tmp/fio_36disks.fio"
+
+cat > $CONFIG << 'EOF'
+[global]
+ioengine=libaio
+randrepeat=0
+norandommap
+thread
+direct=1
+runtime=3600
+time_based
+numjobs=1
+iodepth=128
+rw=read
+bs=64K
+EOF
+
+cpu=0
+for dev in /dev/sd{b..z} /dev/sda{a..k}; do
+    name=$(basename $dev)
+    cat >> $CONFIG << EOF
+
+[$name]
+filename=$dev
+cpus_allowed=$cpu
+EOF
+    cpu=$((cpu + 1))
+done
+
+echo "生成配置文件: $CONFIG"
+echo "运行命令: fio $CONFIG"
+```
+
+### 方案二（简单有效）：增大 bs 到 1M
+
+将 `bs=64K` 改为 `bs=1M`，每个请求本身就是 1MB，不依赖合并即可达到高带宽：
+
+```bash
+fio ... --bs=1M --iodepth=32
+```
+
+bs=1M 时：
+- 单个请求已经足够大，无需合并
+- 即使请求分散到不同 HW Queue 也不影响
+- 降低 iodepth 也能达到满带宽
+
+### 方案三：关闭多硬件队列或减少数量
+
+在 mpt3sas 模块级别限制 HW Queue 数量（需要重新加载驱动）：
+
+```bash
+# 查看当前参数
+cat /sys/module/mpt3sas/parameters/*
+
+# 卸载重载（危险操作，需确认无业务 I/O）
+modprobe -r mpt3sas
+modprobe mpt3sas max_msix_vectors=1
+```
+
+或在内核启动参数中添加：
+
+```
+mpt3sas.max_msix_vectors=1
+```
+
+这会将 HW Queue 减少到 1 个，所有请求在同一队列中合并，但会牺牲多核并行能力。
+
+### 方案四：调整块层参数
 
 ```bash
 for dev in sd{b..z} sda{a..k}; do
-    echo none > /sys/block/$dev/queue/scheduler
+    # 增大 max_sectors_kb 允许更大的合并请求
+    echo 2048 > /sys/block/$dev/queue/max_sectors_kb 2>/dev/null
+
+    # 增大 nr_requests 给调度器更多合并机会
+    echo 1024 > /sys/block/$dev/queue/nr_requests
 done
 ```
-
-这让请求直接从 blk-mq 软件队列派发到 HBA HW Queue，减少调度器引入的批处理不均。
-
-### 5.4 NUMA 亲和性检查
-
-```bash
-# 查看 HBA 所在的 NUMA 节点
-cat /sys/class/scsi_host/host1/device/../numa_node
-# 或
-lspci -s 41:00.0 -vv | grep "NUMA node"
-
-# 将 fio 绑定到 HBA 所在的 NUMA 节点
-numactl --cpunodebind=<node> --membind=<node> fio ...
-```
-
-### 5.5 查看 mpt3sas 驱动参数
-
-```bash
-# 查看 mpt3sas 的可调参数
-ls /sys/module/mpt3sas/parameters/
-cat /sys/module/mpt3sas/parameters/*
-```
-
-关注 `max_queue_depth` 和 `command_retry_count` 等参数。
-
-### 5.6 不同 iodepth 梯度测试验证
-
-```bash
-for depth in 1 4 16 32 64 128 256 512 1024; do
-    echo "=== iodepth=$depth ==="
-    fio --name=bw_test --ioengine=libaio --direct=1 --rw=read \
-        --bs=1M --iodepth=$depth --numjobs=1 --runtime=30 --time_based \
-        --filename=/dev/sdb:/dev/sdc:...:/dev/sdak \
-        --group_reporting=0
-done
-```
-
-预期：iodepth 从 32 增大到 128 时（填满盘端 TCQ），带宽离散度应显著下降。
 
 ---
 
-## 六、总结
+## 六、方案对比
+
+| 方案 | 效果 | 侵入性 | 适用场景 |
+|------|------|--------|---------|
+| **绑核 (taskset/cpus_allowed)** | ★★★★★ | 低 | 最推荐，精准解决 |
+| **增大 bs=1M** | ★★★★★ | 低 | 如果测试场景允许改 bs |
+| **减少 nr_hw_queues** | ★★★★☆ | 高（需重载驱动） | 不方便改 fio 参数时 |
+| **增大 nr_requests** | ★★★☆☆ | 低 | 辅助优化 |
+
+---
+
+## 七、总结
 
 ```
-                        iodepth=32              iodepth=1024
-                        ──────────              ────────────
-盘端 TCQ 填充          32/128 = 25% ←关键!      128/128 = 100%
-TCQ 寻道优化效果        差，方差大               充分优化，方差小
-HBA 总 in-flight       1152/6632 = 17%          4608/6632 = 69%
-blk-mq 排队缓冲       几乎没有                  每盘 ~896 排队
-调度器批处理质量        粗糙，各盘不均            平滑，交替均匀
-带宽均衡性              差，差异 ~100 MB/s       好，基本一致
+问题本质:
+  fio 线程在 120 个 CPU 核心间迁移
+    → 64K 请求分散到不同的 blk-mq 硬件队列
+    → 队列间无法合并请求
+    → 某些盘的请求恰好集中在一个队列 (合并 → 270 MB/s)
+    → 某些盘的请求分散在多个队列 (不合并 → 120 MB/s)
+
+证据:
+  高带宽盘: rrqm/s=4000, rareq-sz=900KB  ← 合并生效
+  低带宽盘: rrqm/s=0,    rareq-sz=64KB   ← 合并失效
+
+解法:
+  为每个 fio 绑定固定 CPU 核心 (taskset -c N fio ...)
+  或 增大 bs 至 1M 以消除对合并的依赖
 ```
-
-**根本原因**：iodepth=32 时盘端 TCQ 只填充了 25%，机械盘无法充分优化寻道路径，各盘因初始磁头位置和数据分布的差异产生不同的寻道效率，且低队列深度下没有足够的请求来"稀释"这种随机波动。叠加 blk-mq 120 个硬件队列的 CPU 亲和性不均和 mq-deadline 批处理抖动，最终表现为 ~100 MB/s 的盘间带宽差异。
-
-**最直接的解法**：将 iodepth 设为 ≥128（填满盘端 TCQ），或同时绑定 CPU + 使用 none 调度器。
