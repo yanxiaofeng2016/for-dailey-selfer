@@ -323,25 +323,34 @@ iostat 数据：
 
 **结论：bs=1M 时每个请求本身已足够大，完全不依赖 blk-mq 的合并机制，因此 HW Queue 分散问题不再影响带宽，完美验证了根因分析。**
 
-### 验证二（建议追加）：bs=64K + taskset 绑核 → 预期均衡
+### 验证二：bs=64K + taskset 绑核（CPU 0-35 顺序绑定） → 部分均衡 ⚠️
 
-如果你的测试场景必须使用 bs=64K，可以用 taskset 绑核验证：
-
-```bash
-cpu=0
-for dev in /dev/sd{b..z} /dev/sda{a..k}; do
-    taskset -c $cpu fio --ioengine=libaio \
-        --randrepeat=0 --norandommap --thread --direct=1 \
-        --group_reporting --name="test_$(basename $dev)" \
-        --runtime=60 --time_based \
-        --numjobs=1 --iodepth=128 \
-        --filename=$dev --rw=read --bs=64K &
-    cpu=$((cpu + 1))
-done
-wait
+```
+参数: --bs=64K --iodepth=128 + taskset -c $cpu (cpu 从 0 递增)
+结果: 28 块盘均衡 (~262-267 MB/s)，8 块盘仍低 (~108-116 MB/s)
 ```
 
-预期：绑核后 64K 请求也能正常合并，所有盘带宽趋于一致（~270 MB/s）。
+低带宽盘恰好对应 **CPU 0-3 和 CPU 32-35**：
+
+```
+sdaa(CPU 0)  sdab(CPU 1)  sdac(CPU 2)  sdad(CPU 3)   → ~108 MB/s, rrqm≈13-42
+sdw(CPU 32)  sdx(CPU 33)  sdy(CPU 34)  sdz(CPU 35)   → ~109-116 MB/s, rrqm≈55-242
+其余 28 盘 (CPU 4-31)                                  → ~262-267 MB/s, rrqm≈3900-4050 ✓
+```
+
+**原因：NUMA 跨节点访问。** 海光 CPU 多 NUMA 节点架构，HBA 卡物理连接在特定 NUMA 节点上。
+CPU 0-3 和 CPU 32-35 位于远端 NUMA 节点，I/O 提交需跨节点通信，请求到达 HW Queue
+的间隔增大，前一个请求已被派发到设备，后续请求到达时无法合并。
+
+### 验证三（建议追加）：bs=64K + taskset 绑定 HBA 本地 NUMA CPU → 预期全部均衡
+
+使用更新后的 `fio_bindcpu_hdd_only.sh`，自动检测 HBA NUMA 节点，仅绑定本地 CPU：
+
+```bash
+sudo bash fio_bindcpu_hdd_only.sh
+```
+
+预期：所有 36 块盘都能正常合并，带宽全部 ~265 MB/s。
 
 ---
 
