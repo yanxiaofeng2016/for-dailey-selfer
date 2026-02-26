@@ -1,0 +1,82 @@
+From: Xiaofeng Yan <yanxiaofeng@example.com>
+Date: Wed, 26 Feb 2026 14:00:00 +0800
+Subject: [PATCH] scsi: mpt3sas: Disable high_iops_queues when online CPUs
+ exceed available MSI-X vectors
+
+When high_iops_queues are enabled on AERO/SEA controllers (e.g. SAS3816,
+SAS3916 used in Broadcom 9500 series HBAs), the driver sets
+irq_affinity.pre_vectors = high_iops_queues (8). These pre_vectors are
+excluded from the kernel's managed CPU affinity spreading in
+pci_alloc_irq_vectors_affinity(). This means only
+(msix_vector_count - high_iops_queues) vectors participate in the
+automatic CPU-to-IRQ affinity assignment.
+
+On systems where num_online_cpus() >= msix_vector_count (e.g., a dual-
+socket server with 128 CPUs using a 9500-8i HBA that supports max 128
+MSI-X vectors), only 128 - 8 = 120 vectors get CPU affinity spreading
+for 128 CPUs. The remaining 8 CPUs must share reply queues with other
+CPUs, leading to:
+
+  - Unbalanced I/O completion distribution across CPUs
+  - Uneven interrupt load and throughput
+  - Unexpected I/O merging behavior changes
+
+This was observed on a Hygon S435 dual-socket system (128 CPUs) with
+9500-8i HBA: FIO bandwidth tests showed significant imbalance across 36
+HDDs. Setting max_msix_vectors=128 (which implicitly disables
+high_iops_queues) resolved the issue. The same HBA on an Intel 4313
+single-socket system (32 CPUs) showed balanced results because
+32 + 8 = 40 << 128, leaving plenty of room.
+
+Fix this by checking whether enabling high_iops_queues would leave
+insufficient MSI-X vectors for 1:1 CPU mapping. When
+num_online_cpus() + MPT3SAS_HIGH_IOPS_REPLY_QUEUES > msix_vector_count,
+disable high_iops_queues to ensure every CPU gets a dedicated reply
+queue vector.
+
+Signed-off-by: Xiaofeng Yan <yanxiaofeng@example.com>
+---
+ drivers/scsi/mpt3sas/mpt3sas_base.c | 25 +++++++++++++++++++++++--
+ 1 file changed, 23 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/scsi/mpt3sas/mpt3sas_base.c b/drivers/scsi/mpt3sas/mpt3sas_base.c
+index xxxxxxxxxxxx..yyyyyyyyyyyy 100644
+--- a/drivers/scsi/mpt3sas/mpt3sas_base.c
++++ b/drivers/scsi/mpt3sas/mpt3sas_base.c
+@@ -3340,9 +3340,30 @@ _base_check_and_enable_high_iops_queues(struct MPT3SAS_ADAPTER *ioc,
+ 	if (!reset_devices && ioc->is_aero_ioc &&
+ 	    hba_msix_vector_count == MPT3SAS_GEN35_MAX_MSIX_QUEUES &&
+ 	    num_online_cpus() >= MPT3SAS_HIGH_IOPS_REPLY_QUEUES &&
+-	    max_msix_vectors == -1)
++	    max_msix_vectors == -1) {
++		/*
++		 * When high_iops_queues are enabled, these queues are set as
++		 * .pre_vectors in irq_affinity descriptor and won't be included
++		 * in the kernel managed CPU affinity spreading. This leaves
++		 * only (hba_msix_vector_count - high_iops_queues) vectors for
++		 * CPU affinity assignment. If online CPUs exceed this number,
++		 * some CPUs will have to share reply queues, resulting in
++		 * unbalanced I/O completions across CPUs.
++		 *
++		 * Disable high_iops_queues when there are not enough MSI-X
++		 * vectors left to provide 1:1 mapping for all online CPUs.
++		 */
++		if (num_online_cpus() + MPT3SAS_HIGH_IOPS_REPLY_QUEUES >
++		    hba_msix_vector_count) {
++			ioc->high_iops_queues = 0;
++			ioc_info(ioc,
++			    "Disabled high_iops_queues: online CPUs (%d) + "
++			    "high_iops_queues (%d) exceeds max MSI-X vectors (%d)\n",
++			    num_online_cpus(),
++			    MPT3SAS_HIGH_IOPS_REPLY_QUEUES,
++			    hba_msix_vector_count);
++			return;
++		}
+ 		ioc->high_iops_queues = MPT3SAS_HIGH_IOPS_REPLY_QUEUES;
+-	else
++	} else
+ 		ioc->high_iops_queues = 0;
+ }
+ 
+-- 
+2.43.0
