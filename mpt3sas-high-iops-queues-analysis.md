@@ -257,7 +257,35 @@ if (!reset_devices && ioc->is_aero_ioc &&
     ioc->high_iops_queues = 0;
 ```
 
-## 7. 结论
+## 7. 社区最新代码状态（Linux 7.0-rc1, 2026-02）
+
+经查验 Torvalds 主线最新代码（Linux **7.0-rc1**），`_base_check_and_enable_high_iops_queues()` 函数**完全没有变化**，仍然存在同样的问题：
+
+```c
+// drivers/scsi/mpt3sas/mpt3sas_base.c (Linux 7.0-rc1, 行 3340-3346)
+if (!reset_devices && ioc->is_aero_ioc &&
+    hba_msix_vector_count == MPT3SAS_GEN35_MAX_MSIX_QUEUES &&
+    num_online_cpus() >= MPT3SAS_HIGH_IOPS_REPLY_QUEUES &&
+    max_msix_vectors == -1)
+        ioc->high_iops_queues = MPT3SAS_HIGH_IOPS_REPLY_QUEUES;
+    else
+        ioc->high_iops_queues = 0;
+```
+
+**没有增加对 `num_online_cpus() + high_iops_queues > msix_vector_count` 的边界检查。**
+
+同样，`_base_alloc_irq_vectors()` 中 `pre_vectors` 的使用方式也完全相同：
+
+```c
+// drivers/scsi/mpt3sas/mpt3sas_base.c (Linux 7.0-rc1, 行 3373)
+struct irq_affinity desc = { .pre_vectors = ioc->high_iops_queues };
+```
+
+通过搜索内核邮件列表（lore.kernel.org）和 git.kernel.org 的提交历史，
+截至 2026 年 2 月，**社区没有任何人报告或修复过此问题**。
+这意味着所有使用 9500 系列 HBA 且 CPU 数 >= 121 的平台都会受此 bug 影响。
+
+## 8. 结论
 
 | 问题 | 答案 |
 |------|------|
@@ -266,3 +294,5 @@ if (!reset_devices && ioc->is_aero_ioc &&
 | 120 从哪来的？ | 128 (HBA 最大) - 8 (high_iops pre_vectors) = 120 |
 | max_msix_vectors=128 为何修复？ | 因为禁用了 high_iops_queues，全部 128 向量都用于 CPU 亲和性分配 |
 | 根本原因？ | high_iops 特性没有检查 `cpu_count + high_iops_queues > msix_vector_count` |
+| 社区最新代码修复了吗？ | **没有**。Linux 7.0-rc1 (2026-02) 仍存在同样的问题 |
+| 影响范围？ | 所有 CPU 数 >= 121 且使用 9500 系列 AERO/SEA HBA 的平台 |
