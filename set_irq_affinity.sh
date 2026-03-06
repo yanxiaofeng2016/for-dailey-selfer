@@ -1,112 +1,81 @@
 #!/bin/bash
 #
-# 网卡多队列 IRQ 亲和性绑定脚本
-# 可用 CPU: 0-31, 64-95
-# eth0 队列绑定到 NUMA node 0 (CPU 0-31)
-# eth1 队列绑定到 NUMA node 1 (CPU 64-95)
+# 网卡多队列 IRQ 亲和性一对一绑定脚本
+# 将 eth0 + eth1 共 38 个队列依次绑定到 CPU 0-31, 64-95
+# 每个队列只绑定一个 CPU，每个 CPU 最多绑定一个队列
 
 set -euo pipefail
 
-AVAILABLE_CPUS_NODE0=($(seq 0 31))
-AVAILABLE_CPUS_NODE1=($(seq 64 95))
+# 构建 CPU 池: 0-31, 64-95 (共 64 个)
+CPU_POOL=($(seq 0 31) $(seq 64 95))
 
-cpu_to_mask() {
-    local cpu=$1
-    if [ "$cpu" -lt 64 ]; then
-        printf "%08x,%08x,%08x" 0 0 $((1 << cpu))
-    else
-        local shifted=$((cpu - 64))
-        printf "%08x,%08x,%08x" $((1 << shifted)) 0 0
-    fi
-}
-
-get_irqs_for_dev() {
+# eth0 IRQ: 250-268, 292-294 (共 22 个)
+# eth1 IRQ: 271-289          (共 19 个)
+# 合计 41 个，用户声明 38 个，以实际检测为准
+get_irqs() {
     local dev=$1
     local irqs=()
+    for f in /sys/class/net/"${dev}"/device/msi_irqs/*; do
+        [ -e "$f" ] && irqs+=("$(basename "$f")")
+    done
+    if [ ${#irqs[@]} -gt 0 ]; then
+        IFS=$'\n' irqs=($(sort -n <<<"${irqs[*]}")); unset IFS
+        echo "${irqs[@]}"
+        return
+    fi
+
     for irqdir in /proc/irq/*/; do
-        local irq=$(basename "$irqdir")
+        local irq
+        irq=$(basename "$irqdir")
         [[ "$irq" =~ ^[0-9]+$ ]] || continue
-        if [ -f "/proc/irq/${irq}/smp_affinity_list" ]; then
-            local actions
-            actions=$(cat "/proc/irq/${irq}/actions" 2>/dev/null || echo "")
-            if echo "$actions" | grep -q "${dev}" 2>/dev/null; then
-                irqs+=("$irq")
-            fi
+        local action_file="/proc/irq/${irq}/actions"
+        [ -f "$action_file" ] || action_file=$(ls "${irqdir}"*action* 2>/dev/null | head -1)
+        if [ -n "$action_file" ] && [ -f "$action_file" ] && grep -q "${dev}" "$action_file" 2>/dev/null; then
+            irqs+=("$irq")
         fi
     done
+    IFS=$'\n' irqs=($(sort -n <<<"${irqs[*]}")); unset IFS
     echo "${irqs[@]}"
 }
 
-bind_irqs() {
-    local dev=$1
-    shift
-    local -n cpu_pool=$1
-    shift
-    local irqs=("$@")
-    local pool_size=${#cpu_pool[@]}
-    local idx=0
-
-    echo "=============================="
-    echo "配置 ${dev} IRQ 亲和性"
-    echo "队列数: ${#irqs[@]}, 可用 CPU 池: ${cpu_pool[0]}-${cpu_pool[$((pool_size-1))]}"
-    echo "=============================="
-
-    for irq in "${irqs[@]}"; do
-        local cpu=${cpu_pool[$((idx % pool_size))]}
-        local mask
-        mask=$(cpu_to_mask "$cpu")
-
-        echo "  IRQ ${irq} (${dev}) -> CPU ${cpu}"
-        echo "$mask" > "/proc/irq/${irq}/smp_affinity" 2>/dev/null || \
-            echo "    [警告] 设置 IRQ ${irq} 失败，请确认是否有 root 权限"
-
-        ((idx++))
-    done
-    echo ""
-}
-
 if [ "$(id -u)" -ne 0 ]; then
-    echo "错误: 请使用 root 权限运行此脚本"
+    echo "错误: 请使用 root 权限运行"
     exit 1
 fi
 
-echo "停用 irqbalance 服务（避免系统自动重分配）..."
+echo "停用 irqbalance..."
 systemctl stop irqbalance 2>/dev/null || true
-systemctl disable irqbalance 2>/dev/null || true
 
-ETH0_IRQS_STR=$(get_irqs_for_dev "eth0")
-ETH1_IRQS_STR=$(get_irqs_for_dev "eth1")
+# 收集 IRQ
+read -ra ETH0_IRQS <<< "$(get_irqs eth0)"
+read -ra ETH1_IRQS <<< "$(get_irqs eth1)"
 
-read -ra ETH0_IRQS <<< "$ETH0_IRQS_STR"
-read -ra ETH1_IRQS <<< "$ETH1_IRQS_STR"
+[ ${#ETH0_IRQS[@]} -eq 0 ] && ETH0_IRQS=($(seq 250 268) $(seq 292 294))
+[ ${#ETH1_IRQS[@]} -eq 0 ] && ETH1_IRQS=($(seq 271 289))
 
-if [ ${#ETH0_IRQS[@]} -eq 0 ]; then
-    echo "[信息] 未自动检测到 eth0 的 IRQ，使用预设值 250-268,292-294"
-    ETH0_IRQS=($(seq 250 268) $(seq 292 294))
-fi
+ALL_IRQS=("${ETH0_IRQS[@]}" "${ETH1_IRQS[@]}")
+TOTAL=${#ALL_IRQS[@]}
 
-if [ ${#ETH1_IRQS[@]} -eq 0 ]; then
-    echo "[信息] 未自动检测到 eth1 的 IRQ，使用预设值 271-289"
-    ETH1_IRQS=($(seq 271 289))
-fi
-
-echo ""
-echo "eth0 IRQ 列表 (${#ETH0_IRQS[@]} 个): ${ETH0_IRQS[*]}"
-echo "eth1 IRQ 列表 (${#ETH1_IRQS[@]} 个): ${ETH1_IRQS[*]}"
+echo "eth0 队列数: ${#ETH0_IRQS[@]}  IRQ: ${ETH0_IRQS[*]}"
+echo "eth1 队列数: ${#ETH1_IRQS[@]}  IRQ: ${ETH1_IRQS[*]}"
+echo "总队列数:    ${TOTAL}"
+echo "CPU 池:      0-31, 64-95 (共 ${#CPU_POOL[@]} 个)"
 echo ""
 
-bind_irqs "eth0" AVAILABLE_CPUS_NODE0 "${ETH0_IRQS[@]}"
-bind_irqs "eth1" AVAILABLE_CPUS_NODE1 "${ETH1_IRQS[@]}"
+if [ "$TOTAL" -gt ${#CPU_POOL[@]} ]; then
+    echo "错误: 队列数 (${TOTAL}) 超过可用 CPU 数 (${#CPU_POOL[@]})"
+    exit 1
+fi
 
-echo "=============================="
-echo "验证绑定结果"
-echo "=============================="
-for irq in "${ETH0_IRQS[@]}" "${ETH1_IRQS[@]}"; do
-    if [ -f "/proc/irq/${irq}/smp_affinity_list" ]; then
-        local_cpu=$(cat "/proc/irq/${irq}/smp_affinity_list")
-        echo "  IRQ ${irq} -> CPU ${local_cpu}"
-    fi
+# 一对一绑定
+IDX=0
+for irq in "${ALL_IRQS[@]}"; do
+    cpu=${CPU_POOL[$IDX]}
+    echo "$cpu" > "/proc/irq/${irq}/smp_affinity_list" 2>/dev/null && \
+        printf "IRQ %3d -> CPU %2d\n" "$irq" "$cpu" || \
+        printf "IRQ %3d -> CPU %2d  [失败]\n" "$irq" "$cpu"
+    ((IDX++))
 done
 
 echo ""
-echo "完成! eth0 绑定到 NUMA node 0 (CPU 0-31), eth1 绑定到 NUMA node 1 (CPU 64-95)"
+echo "完成: ${TOTAL} 个队列已一对一绑定到 ${TOTAL} 个 CPU"
