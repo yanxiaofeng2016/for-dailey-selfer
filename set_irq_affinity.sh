@@ -74,7 +74,7 @@ for irq in "${ALL_IRQS[@]}"; do
     echo "$cpu" > "/proc/irq/${irq}/smp_affinity_list" 2>/dev/null && \
         printf "IRQ %3d -> CPU %2d\n" "$irq" "$cpu" || \
         printf "IRQ %3d -> CPU %2d  [失败]\n" "$irq" "$cpu"
-    ((IDX++))
+    IDX=$((IDX + 1))
 done
 
 echo ""
