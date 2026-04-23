@@ -1,0 +1,51 @@
+#!/usr/bin/env bpftrace
+/*
+ * bpf_blk_merge_6.6.bt -- plug merge vs blk_mq_sched_bio_merge (try vs success)
+ *
+ * Positional arg $1: userspace PID to filter (0 = all tasks).
+ *
+ *   sudo bpftrace bpf_blk_merge_6.6.bt 0
+ *   sudo bpftrace bpf_blk_merge_6.6.bt $(pidof fio)
+ */
+
+BEGIN
+{
+  printf("pid filter: %d (0=all)\n", $1);
+  printf("plug=blk_attempt_plug_merge  sched=blk_mq_sched_bio_merge\n");
+  printf("success if retval!=0 (bool)\nCtrl-C prints summary.\n\n");
+}
+
+kprobe:blk_attempt_plug_merge
+/$1 == 0 || pid == $1/
+{
+  @plug_try[comm] = count();
+}
+
+kretprobe:blk_attempt_plug_merge
+/($1 == 0 || pid == $1) && retval != 0/
+{
+  @plug_ok[comm] = count();
+}
+
+kprobe:blk_mq_sched_bio_merge
+/$1 == 0 || pid == $1/
+{
+  @sched_try[comm] = count();
+}
+
+kretprobe:blk_mq_sched_bio_merge
+/($1 == 0 || pid == $1) && retval != 0/
+{
+  @sched_ok[comm] = count();
+}
+
+END
+{
+  printf("\n=== plug merge ===\n");
+  printf("try:\n");        print(@plug_try);
+  printf("success:\n");   print(@plug_ok);
+
+  printf("\n=== scheduler merge ===\n");
+  printf("try:\n");        print(@sched_try);
+  printf("success:\n");   print(@sched_ok);
+}
