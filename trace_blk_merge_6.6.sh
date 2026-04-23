@@ -38,7 +38,8 @@ perf_merge_events() {
   echo ">>> ${DURATION}s: 录制 block_bio_backmerge / block_bio_frontmerge + 调用栈"
   echo ">>> 读栈：若栈顶附近出现 blk_attempt_plug_merge —— 多为 plug；"
   echo ">>> 若主要经 dd_bio_merge / blk_mq_sched_bio_merge —— 调度器路径。"
-  perf record -a -g --call-graph fp,dwarf -e block:block_bio_backmerge -e block:block_bio_frontmerge \
+  # Use -g only: "fp,dwarf" is invalid (perf expects dwarf,stack_size not fp+dwarf).
+  perf record -a -g -e block:block_bio_backmerge -e block:block_bio_frontmerge \
     -- sleep "$DURATION"
   echo ""
   echo ">>> 以下片段摘自 perf script（完整见 perf report）"
@@ -77,7 +78,7 @@ perf_probe_record() {
     perf probe -a blk_mq_sched_bio_merge 2>/dev/null || echo "WARN: blk_mq_sched_bio_merge 探针添加失败"
   fi
   echo ">>> ${DURATION}s: perf probe 事件（若上面失败则无数据）"
-  perf record -a -g --call-graph fp,dwarf \
+  perf record -a -g \
     -e probe:blk_attempt_plug_merge -e probe:blk_mq_sched_bio_merge \
     -- sleep "$DURATION" || die "perf record 失败；请运行: $0 perf-probe-help"
   perf script | head -80 || true
