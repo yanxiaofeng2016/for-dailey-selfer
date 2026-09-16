@@ -28,10 +28,18 @@ SERIES = [
 # Excel default palette used by the reference radar chart.
 COLORS = ["#4472C4", "#ED7D31", "#A5A5A5", "#FFC000"]
 GRID_COLOR = "#D4D4D4"
-LABEL_COLOR = "#8A8A8A"
-TITLE_COLOR = "#8A8A8A"
+LABEL_COLOR = "#5A5A5A"
+TITLE_COLOR = "#6A6A6A"
 R_MAX = 0.10
 R_TICKS = [0.00, 0.02, 0.04, 0.06, 0.08, 0.10]
+# Bottom axes sit near the image edge; give those labels extra radius.
+LABEL_RADIUS = {
+    "cpu": 1.20,
+    "内存容量": 1.22,
+    "内存带宽": 1.28,
+    "网络带宽": 1.28,
+    "磁盘带宽": 1.22,
+}
 
 
 def polygon_angles(n: int) -> np.ndarray:
@@ -43,17 +51,22 @@ def closed(values: np.ndarray) -> np.ndarray:
     return np.append(values, values[0])
 
 
-def label_alignment(angle: float) -> tuple[str, str]:
-    deg = (np.degrees(angle) + 360) % 360
-    if 80 <= deg <= 100:
-        return "center", "bottom"
-    if deg <= 20 or deg >= 340:
-        return "left", "center"
-    if 250 <= deg <= 300:
-        return "left", "top"
-    if 200 <= deg <= 250:
-        return "right", "top"
-    return "right", "center"
+def label_alignment(category: str) -> tuple[str, str]:
+    return {
+        "cpu": ("center", "bottom"),
+        "内存容量": ("left", "center"),
+        "内存带宽": ("center", "top"),
+        "网络带宽": ("center", "top"),
+        "磁盘带宽": ("right", "center"),
+    }[category]
+
+
+def format_ratio(value: float) -> str:
+    if value == 0:
+        return "0"
+    if abs(value) < 0.01:
+        return f"{value:.3f}"
+    return f"{value:.2f}"
 
 
 def main() -> None:
@@ -61,11 +74,15 @@ def main() -> None:
     angles = polygon_angles(n)
     angles_c = closed(angles)
 
-    fig, ax = plt.subplots(figsize=(12.8, 8.4))
+    fig = plt.figure(figsize=(13.2, 11.2))
     fig.patch.set_facecolor("white")
+    gs = fig.add_gridspec(2, 1, height_ratios=[3.6, 1.0], hspace=0.16)
+    ax = fig.add_subplot(gs[0])
+    ax_table = fig.add_subplot(gs[1])
     ax.set_facecolor("white")
     ax.set_aspect("equal")
     ax.axis("off")
+    ax_table.axis("off")
 
     for radius in R_TICKS[1:]:
         ax.plot(
@@ -87,9 +104,12 @@ def main() -> None:
 
     for (name, values), color in zip(SERIES, COLORS):
         radius = closed(np.asarray(values, dtype=float))
+        xs = radius * np.cos(angles_c)
+        ys = radius * np.sin(angles_c)
+        ax.fill(xs, ys, color=color, alpha=0.07, zorder=2)
         ax.plot(
-            radius * np.cos(angles_c),
-            radius * np.sin(angles_c),
+            xs,
+            ys,
             color=color,
             linewidth=2.35,
             label=name,
@@ -97,6 +117,38 @@ def main() -> None:
             solid_joinstyle="round",
             zorder=3,
         )
+        ax.scatter(
+            xs[:-1],
+            ys[:-1],
+            s=28,
+            color=color,
+            zorder=4,
+            edgecolors="white",
+            linewidths=0.6,
+        )
+
+    # Keep small-axis values readable: 网络带宽 is ~10x smaller than cpu,
+    # so points sit near the origin on a shared 0.10 scale.
+    label_offsets = {
+        "内存带宽": [0.012, 0.018, -0.012, 0.012],
+        "网络带宽": [0.018, 0.028, 0.038, 0.048],
+    }
+    for series_idx, ((_, values), color) in enumerate(zip(SERIES, COLORS)):
+        for category, extra in label_offsets.items():
+            axis_idx = CATEGORIES.index(category)
+            value = values[axis_idx]
+            angle = angles[axis_idx]
+            r_text = max(value, 0.012) + extra[series_idx]
+            ax.text(
+                r_text * np.cos(angle),
+                r_text * np.sin(angle),
+                format_ratio(value),
+                color=color,
+                fontsize=8.5,
+                ha="center",
+                va="center",
+                zorder=5,
+            )
 
     for tick in R_TICKS:
         ax.text(
@@ -110,32 +162,34 @@ def main() -> None:
             zorder=4,
         )
 
-    label_radius = R_MAX * 1.18
     for category, angle in zip(CATEGORIES, angles):
-        ha, va = label_alignment(angle)
-        extra_y = R_MAX * 0.06 if category == "cpu" else 0
+        ha, va = label_alignment(category)
+        radius = R_MAX * LABEL_RADIUS[category]
+        extra_y = R_MAX * 0.05 if category == "cpu" else 0
+        extra_y -= R_MAX * 0.04 if category in {"内存带宽", "网络带宽"} else 0
         ax.text(
-            label_radius * np.cos(angle),
-            label_radius * np.sin(angle) + extra_y,
+            radius * np.cos(angle),
+            radius * np.sin(angle) + extra_y,
             category,
             ha=ha,
             va=va,
             color=LABEL_COLOR,
-            fontsize=12,
+            fontsize=14,
         )
 
-    ax.set_xlim(-R_MAX * 1.52, R_MAX * 1.52)
-    ax.set_ylim(-R_MAX * 1.32, R_MAX * 1.42)
+    ax.set_xlim(-R_MAX * 1.62, R_MAX * 1.62)
+    ax.set_ylim(-R_MAX * 1.62, R_MAX * 1.48)
 
-    fig.suptitle("与规格比值", color=TITLE_COLOR, fontsize=20, y=0.97)
+    fig.suptitle("与规格比值", color=TITLE_COLOR, fontsize=20, y=0.98)
     handles = [
-        Line2D([0], [0], color=color, linewidth=2.35) for color in COLORS
+        Line2D([0], [0], color=color, linewidth=2.35, marker="o", markersize=5)
+        for color in COLORS
     ]
     fig.legend(
         handles,
         [name for name, _ in SERIES],
         loc="upper center",
-        bbox_to_anchor=(0.5, 0.915),
+        bbox_to_anchor=(0.5, 0.935),
         ncol=4,
         frameon=False,
         fontsize=11,
@@ -145,9 +199,38 @@ def main() -> None:
         labelcolor=LABEL_COLOR,
     )
 
-    fig.subplots_adjust(top=0.82, bottom=0.06, left=0.08, right=0.92)
+    col_labels = ["配置"] + CATEGORIES
+    cell_text = [
+        [name] + [format_ratio(value) for value in values]
+        for name, values in SERIES
+    ]
+    table = ax_table.table(
+        cellText=cell_text,
+        colLabels=col_labels,
+        loc="center",
+        cellLoc="center",
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(10)
+    table.scale(1.0, 1.55)
+    for (row, col), cell in table.get_celld().items():
+        cell.set_edgecolor("#E5E5E5")
+        cell.set_linewidth(0.8)
+        if row == 0:
+            cell.set_facecolor("#F4F6F8")
+            cell.set_text_props(color=LABEL_COLOR)
+        elif col == 0:
+            cell.set_text_props(ha="left", color=LABEL_COLOR)
+            cell.PAD = 0.08
+        else:
+            cell.set_text_props(color=COLORS[row - 1])
+        # Emphasize the two bandwidth columns the previous chart hid near the origin.
+        if row == 0 and col in {3, 4}:
+            cell.set_facecolor("#FFF6D8")
+
+    fig.subplots_adjust(top=0.86, bottom=0.04, left=0.07, right=0.93)
     output = Path(__file__).with_suffix(".png")
-    fig.savefig(output, dpi=180, bbox_inches="tight", facecolor="white")
+    fig.savefig(output, dpi=180, bbox_inches="tight", facecolor="white", pad_inches=0.35)
     plt.close(fig)
     print(f"wrote {output}")
 
