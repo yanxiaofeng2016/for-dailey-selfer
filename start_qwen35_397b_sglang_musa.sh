@@ -24,7 +24,6 @@
 #   --tp-size 4 --pp-size 1 --trust-remote-code --dtype bfloat16
 #   --port 31216 --attention-backend fa3 --page-size 64
 #   --watchdog-timeout 36000 --kv-cache-dtype fp8_e4m3
-#   --enable-piecewise-cuda-graph
 #   --speculative-algorithm EAGLE --speculative-num-steps 3
 #   --speculative-eagle-topk 1 --speculative-num-draft-tokens 4
 #   --host 0.0.0.0 --mem-fraction-static 0.85
@@ -43,7 +42,14 @@
 #   3. HIP_*、HSA_*、ROC_*、USE_DCU_*、SGLANG_USE_LIGHTOP、SGLANG_USE_AITER_LINEAR_ATTN、
 #      SGLANG_KV_LAYOUT_DCU_FA、SGLANG_USE_FP8_W8A8_MOE、NCCL_MIN/MAX_NCHANNELS
 #      这些只作用于海光 DCU 或那台机器的通信调优，不带进摩尔线程进程。
-#   4. --linear-attn-backend flashinfer
+#   4. --enable-piecewise-cuda-graph
+#      v0.5.12 里这个参数已废弃，解析后不生效。piecewise 默认会开，
+#      但 Qwen3.5 的结构是 Qwen3_5MoeForConditionalGeneration，属于多模态模型，
+#      启动时会被自动关掉。日志仍打印
+#      "because --disable-piecewise-cuda-graph is set"，并不表示命令行写了 disable。
+#      要跳过自动关闭，参数是 --enforce-piecewise-cuda-graph。海光脚本里的 enable
+#      在同一版本上同样不生效。强制打开前先看海光日志是否也是这句。
+#   5. --linear-attn-backend flashinfer
 #      对应海光的 SGLANG_USE_AITER_LINEAR_ATTN=1。Qwen3.5 有 GDN 线性注意力，
 #      摩尔线程上要用 FlashInfer，否则混合注意力起不来。这是后端替换，不是额外加速开关。
 #
@@ -185,7 +191,6 @@ cmd=(
   --page-size 64
   --watchdog-timeout 36000
   --kv-cache-dtype fp8_e4m3
-  --enable-piecewise-cuda-graph
   --speculative-algorithm EAGLE
   --speculative-num-steps 3
   --speculative-eagle-topk 1
@@ -219,7 +224,7 @@ fi
   printf ' %q' "${cmd[@]}"
   echo
   echo "若 EAGLE 报缺少 draft model: Qwen3.5 自带 MTP，把 --speculative-algorithm EAGLE 改成 NEXTN，3/1/4 三个数字不要改。改名后两边不再是同一条投机路径，对比时要注明。"
-  echo "piecewise CUDA graph 若捕获失败，是当前 SGLang-MUSA 对这种分段图的支持问题，服务日志里会有报错。对比时记录是否去掉了 --enable-piecewise-cuda-graph。"
+  echo "v0.5.12 的 --enable-piecewise-cuda-graph 已废弃，不会打开 piecewise。Qwen3.5 是多模态结构，启动时会自动关闭，日志仍写 because --disable-piecewise-cuda-graph is set。"
   echo "dmesg 里的 submission response INVALID 是 mtgpu 驱动拒绝了已提交的 GPU 命令。上次出现在 3.3.5 驱动回放 CUDA Graph 时，换到 5.2.0-server 后普通 CUDA Graph 已能用。当前这台机器若再出现，把 dmesg 里的 cmd 和 Command Graph 行保留下来。"
   echo "若 --kv-cache-dtype fp8_e4m3 报不支持: 去掉该参数会退回 bf16 KV，和海光不再同配，对比时要注明。"
   echo "========================================"
