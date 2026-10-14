@@ -59,9 +59,12 @@
 set -u
 set -o pipefail
 
-# 按实际使用的 GPU 编号修改。个数必须等于 TP_SIZE。
-export MTHREADS_VISIBLE_DEVICES="${MTHREADS_VISIBLE_DEVICES:-4,5,6,7}"
-TP_SIZE="${TP_SIZE:-4}"
+# 容器里若已经 export 了 8 张卡，未指定 TP_SIZE 时跟卡数走。
+# 海光原脚本是 4 张卡。这台 S5000 要装下该模型需要 8 张卡。
+export MTHREADS_VISIBLE_DEVICES="${MTHREADS_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
+if [[ -z "${TP_SIZE:-}" ]]; then
+  TP_SIZE=$(awk -F',' '{print NF}' <<<"$MTHREADS_VISIBLE_DEVICES")
+fi
 
 # 单机不要用 bond0。容器若继承了多机环境变量，Gloo 会报 Unable to find address for: bond0。
 if [[ -z "${GLOO_SOCKET_IFNAME:-}" || "${GLOO_SOCKET_IFNAME}" == "bond0" ]]; then
@@ -84,10 +87,22 @@ unset HIP_VISIBLE_DEVICES HSA_ENABLE_COREDUMP USE_DCU_CUSTOM_ALLREDUCE \
   SGLANG_KV_LAYOUT_DCU_FA SGLANG_USE_AITER_LINEAR_ATTN SGLANG_USE_FP8_W8A8_MOE \
   NCCL_MIN_NCHANNELS NCCL_MAX_NCHANNELS || true
 
-# 按本机目录修改。容器内路径，对应上面 docker -v 的挂载。
-MODEL_PATH="${MODEL_PATH:-/models/Qwen3.5-397B-A17B-FP8}"
+# 按本机目录修改。当前这台容器的权重在 /data/models，工作目录是 /sgl-workspace/sglang。
+if [[ -z "${MODEL_PATH:-}" ]]; then
+  if [[ -d /data/models/Qwen3.5-397B-A17B-FP8 ]]; then
+    MODEL_PATH=/data/models/Qwen3.5-397B-A17B-FP8
+  else
+    MODEL_PATH=/models/Qwen3.5-397B-A17B-FP8
+  fi
+fi
 PORT="${PORT:-31216}"
-WORK_DIR="${WORK_DIR:-/lujq}"
+if [[ -z "${WORK_DIR:-}" ]]; then
+  if [[ -d /lujq ]]; then
+    WORK_DIR=/lujq
+  else
+    WORK_DIR=/sgl-workspace/sglang
+  fi
+fi
 LOG_DIR="${LOG_DIR:-$WORK_DIR/log/Qwen3.5-397B-A17B-FP8-musa}"
 export SGLANG_TORCH_PROFILER_DIR="${SGLANG_TORCH_PROFILER_DIR:-$WORK_DIR/profile}"
 
@@ -106,6 +121,7 @@ SERVER_LOG="$LOG_DIR/server_$(date +%Y%m%d_%H%M%S).log"
 gpu_count=$(awk -F',' '{print NF}' <<<"$MTHREADS_VISIBLE_DEVICES")
 if [[ "$gpu_count" -ne "$TP_SIZE" ]]; then
   echo "MTHREADS_VISIBLE_DEVICES=$MTHREADS_VISIBLE_DEVICES 共 ${gpu_count} 张卡，TP_SIZE=$TP_SIZE。两者必须相同。" | tee -a "$SERVER_LOG"
+  echo "8 张卡启动: TP_SIZE=${gpu_count} MODEL_PATH=/data/models/Qwen3.5-397B-A17B-FP8 WORK_DIR=/sgl-workspace/sglang bash $0" | tee -a "$SERVER_LOG"
   exit 1
 fi
 
