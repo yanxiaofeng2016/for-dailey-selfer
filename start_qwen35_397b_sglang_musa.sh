@@ -203,7 +203,8 @@ fi
   printf ' %q' "${cmd[@]}"
   echo
   echo "若 EAGLE 报缺少 draft model: Qwen3.5 自带 MTP，把 --speculative-algorithm EAGLE 改成 NEXTN，3/1/4 三个数字不要改。改名后两边不再是同一条投机路径，对比时要注明。"
-  echo "若 piecewise CUDA graph 捕获失败或 dmesg 出现 submission response INVALID: 这是摩尔线程 Graph 回放问题。对比时再单独记录是否关掉了 --enable-piecewise-cuda-graph。"
+  echo "piecewise CUDA graph 若捕获失败，是当前 SGLang-MUSA 对这种分段图的支持问题，服务日志里会有报错。对比时记录是否去掉了 --enable-piecewise-cuda-graph。"
+  echo "dmesg 里的 submission response INVALID 是 mtgpu 驱动拒绝了已提交的 GPU 命令。上次出现在 3.3.5 驱动回放 CUDA Graph 时，换到 5.2.0-server 后普通 CUDA Graph 已能用。当前这台机器若再出现，把 dmesg 里的 cmd 和 Command Graph 行保留下来。"
   echo "若 --kv-cache-dtype fp8_e4m3 报不支持: 去掉该参数会退回 bf16 KV，和海光不再同配，对比时要注明。"
   echo "========================================"
 } | tee -a "$SERVER_LOG"
