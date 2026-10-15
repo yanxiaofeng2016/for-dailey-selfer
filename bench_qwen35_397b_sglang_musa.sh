@@ -7,7 +7,8 @@
 #
 # 服务地址是启动脚本的 --host 0.0.0.0 --port 31216。
 # --backend sglang 走原生 /generate，不使用海光权重名。
-# dataset-name=random 时不读取 ShareGPT 文件，DATASET_PATH 只占位，便于和海光命令对齐。
+# dataset-name=random 会读本地 ShareGPT json；文件不存在时这版 SGLang 会去 Hugging Face 下载。
+# 容器没有外网。本地没有这份 json 时改用 random-ids，只在本机用词表生成 token。
 
 set -u
 set -o pipefail
@@ -25,8 +26,15 @@ REQUEST_MULTIPLIER=4
 REPEAT_COUNT=3
 WARMUP_REQUESTS=1
 
-DATASET_NAME="random"
 DATASET_PATH="${DATASET_PATH:-/lujq/code/ShareGPT_V3_unfiltered_cleaned_split.json}"
+# 有本地 ShareGPT 时与海光的 random 相同。没有则不要下载，改用 random-ids。
+if [[ -z "${DATASET_NAME:-}" ]]; then
+  if [[ -s "$DATASET_PATH" ]]; then
+    DATASET_NAME=random
+  else
+    DATASET_NAME=random-ids
+  fi
+fi
 
 if [[ -z "${WORK_DIR:-}" ]]; then
   if [[ -d /lujq ]]; then
@@ -58,6 +66,10 @@ FAIL_COUNT=0
   echo "HOST: $HOST"
   echo "PORT: $PORT"
   echo "DATASET_NAME: $DATASET_NAME"
+  echo "DATASET_PATH: $DATASET_PATH"
+  if [[ "$DATASET_NAME" == "random-ids" ]]; then
+    echo "本地没有 ShareGPT json，使用 random-ids，不访问外网。输入来自词表随机 token，和海光 random 使用的 ShareGPT 文本不同。"
+  fi
   echo "INPUT_LENGTHS: ${INPUT_LENGTHS[*]}"
   echo "CONCURRENCIES: ${CONCURRENCIES[*]}"
   echo "OUTPUT_LEN: $OUTPUT_LEN"
