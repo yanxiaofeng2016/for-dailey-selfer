@@ -7,8 +7,8 @@
 #
 # 服务地址是启动脚本的 --host 0.0.0.0 --port 31216。
 # --backend sglang 走原生 /generate，不使用海光权重名。
-# dataset-name=random 会读本地 ShareGPT json；文件不存在时这版 SGLang 会去 Hugging Face 下载。
-# 容器没有外网。本地没有这份 json 时改用 random-ids，只在本机用词表生成 token。
+# dataset-name=random 读取 /data/models/ShareGPT_V3_unfiltered_cleaned_split.json。
+# 这份文件已在容器内。路径无效时不再访问 Hugging Face，改用 random-ids。
 
 set -u
 set -o pipefail
@@ -26,7 +26,7 @@ REQUEST_MULTIPLIER=4
 REPEAT_COUNT=3
 WARMUP_REQUESTS=1
 
-DATASET_PATH="${DATASET_PATH:-/lujq/code/ShareGPT_V3_unfiltered_cleaned_split.json}"
+DATASET_PATH="${DATASET_PATH:-/data/models/ShareGPT_V3_unfiltered_cleaned_split.json}"
 # 有本地 ShareGPT 时与海光的 random 相同。没有则不要下载，改用 random-ids。
 if [[ -z "${DATASET_NAME:-}" ]]; then
   if [[ -s "$DATASET_PATH" ]]; then
@@ -34,6 +34,10 @@ if [[ -z "${DATASET_NAME:-}" ]]; then
   else
     DATASET_NAME=random-ids
   fi
+fi
+if [[ "$DATASET_NAME" == "random" && ! -s "$DATASET_PATH" ]]; then
+  echo "DATASET_NAME=random 需要本地文件: $DATASET_PATH"
+  exit 1
 fi
 
 if [[ -z "${WORK_DIR:-}" ]]; then
