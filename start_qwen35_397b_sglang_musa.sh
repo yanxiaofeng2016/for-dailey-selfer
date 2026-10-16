@@ -5,21 +5,10 @@
 #   bash start_qwen35_397b_sglang_musa.sh Qwen3.5-397B-A17B-Channel-FP8-w8a8
 #   bash start_qwen35_397b_sglang_musa.sh /data/models/Qwen3.5-397B-A17B-FP8
 #
-# Docker 启动容器（在宿主机执行，按本机目录改挂载）:
+# Docker 在宿主机执行 run_musa_sglang_container.sh。
+# 镜像 local/ctr-33869d47a065:20261016，宿主机 /data1/models 挂到容器 /data/models。
 # 不要使用海光的 --device=/dev/kfd、/dev/dri、/dev/mkfd，也不要挂载 /opt/hyhal。
 # 摩尔线程用 --privileged 暴露 /dev/musa*。
-#
-# docker run -it --shm-size 64g --network=host \
-#   --name musa-sglang \
-#   --privileged \
-#   --cap-add=SYS_PTRACE \
-#   --security-opt seccomp=unconfined \
-#   -u root \
-#   -v /data/models:/models:ro \
-#   -v /home/lujq:/lujq \
-#   -w /lujq \
-#   registry.mthreads.com/mcconline/inference/sglang:v0.5.12.post1-ph1-4.3.5-torch2.9.0-20260805 \
-#   bash
 #
 # 与海光脚本相同的服务参数:
 #   --tp-size 4 --pp-size 1 --trust-remote-code --dtype bfloat16
