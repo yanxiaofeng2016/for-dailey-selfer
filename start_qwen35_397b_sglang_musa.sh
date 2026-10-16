@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # 摩尔线程 MTT S5000 上启动 Qwen3.5-397B，服务参数与海光 BW1100 脚本对齐，便于对比。
 #
-# 在容器里执行:
-#   bash start_qwen35_397b_sglang_musa.sh
+# 在容器里执行，模型目录或模型名作为第一个参数。日志按模型名分开。
+#   bash start_qwen35_397b_sglang_musa.sh Qwen3.5-397B-A17B-Channel-FP8-w8a8
+#   bash start_qwen35_397b_sglang_musa.sh /data/models/Qwen3.5-397B-A17B-FP8
 #
 # Docker 启动容器（在宿主机执行，按本机目录改挂载）:
 # 不要使用海光的 --device=/dev/kfd、/dev/dri、/dev/mkfd，也不要挂载 /opt/hyhal。
@@ -35,7 +36,7 @@
 # 不能照搬、脚本里已改掉的部分:
 #   1. --quantization slimquant_marlin
 #      这是海光镜像的量化后端。摩尔线程镜像没有这个选项，传上去会直接退出。
-#      默认权重是 /data/models/Qwen3.5-397B-A17B-Channel-FP8-w8a8。
+#      模型由第一个参数指定，例如 Qwen3.5-397B-A17B-Channel-FP8-w8a8。
 #      不传 slimquant_marlin，由镜像按 checkpoint 的 quantization_config 识别 FP8。
 #   2. --numa-node 4 5 5 7
 #      这是 BW1100 的 NUMA 拓扑。填错会绑到错误的 CPU。默认不传，按本机 numactl -H 填。
@@ -93,9 +94,76 @@ unset HIP_VISIBLE_DEVICES HSA_ENABLE_COREDUMP USE_DCU_CUSTOM_ALLREDUCE \
   SGLANG_KV_LAYOUT_DCU_FA SGLANG_USE_AITER_LINEAR_ATTN SGLANG_USE_FP8_W8A8_MOE \
   NCCL_MIN_NCHANNELS NCCL_MAX_NCHANNELS || true
 
-# 容器内 Channel-FP8 权重目录。可用 MODEL_PATH 覆盖。
-MODEL_PATH="${MODEL_PATH:-/data/models/Qwen3.5-397B-A17B-Channel-FP8-w8a8}"
-SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-Qwen3.5-397B-A17B-Channel-FP8-w8a8}"
+MODELS_DIR="${MODELS_DIR:-/data/models}"
+
+usage() {
+  cat <<EOF
+用法: bash $0 <模型目录或模型名>
+
+模型名不含路径时，在 ${MODELS_DIR} 下查找。
+日志默认写到 \$WORK_DIR/log/<模型名>-musa/server_*.log。
+可用环境变量 MODEL_PATH、LOG_DIR、WORK_DIR、PORT、SERVED_MODEL_NAME 覆盖。
+
+示例:
+  bash $0 Qwen3.5-397B-A17B-Channel-FP8-w8a8
+  bash $0 /data/models/Qwen3.5-397B-A17B-FP8
+EOF
+}
+
+MODEL_ARG=""
+if [[ $# -gt 0 ]]; then
+  case "$1" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --model)
+      if [[ $# -lt 2 || -z "${2:-}" ]]; then
+        usage >&2
+        exit 1
+      fi
+      MODEL_ARG="$2"
+      shift 2
+      ;;
+    --model=*)
+      MODEL_ARG="${1#--model=}"
+      shift
+      ;;
+    -*)
+      echo "未知参数: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+    *)
+      MODEL_ARG="$1"
+      shift
+      ;;
+  esac
+fi
+if [[ $# -gt 0 ]]; then
+  echo "多余参数: $*" >&2
+  usage >&2
+  exit 1
+fi
+
+if [[ -n "$MODEL_ARG" ]]; then
+  if [[ "$MODEL_ARG" == /* || "$MODEL_ARG" == */* || -d "$MODEL_ARG" ]]; then
+    MODEL_PATH="$MODEL_ARG"
+  else
+    MODEL_PATH="${MODELS_DIR%/}/$MODEL_ARG"
+  fi
+elif [[ -z "${MODEL_PATH:-}" ]]; then
+  usage >&2
+  exit 1
+fi
+
+MODEL_NAME="$(basename "${MODEL_PATH%/}")"
+if [[ ! -d "$MODEL_PATH" ]]; then
+  echo "模型目录不存在: $MODEL_PATH" >&2
+  echo "传入 ${MODELS_DIR} 下的目录名，或完整路径。" >&2
+  exit 1
+fi
+SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-$MODEL_NAME}"
 PORT="${PORT:-31216}"
 if [[ -z "${WORK_DIR:-}" ]]; then
   if [[ -d /lujq ]]; then
@@ -104,16 +172,15 @@ if [[ -z "${WORK_DIR:-}" ]]; then
     WORK_DIR=/sgl-workspace/sglang
   fi
 fi
-LOG_DIR="${LOG_DIR:-$WORK_DIR/log/Qwen3.5-397B-A17B-Channel-FP8-w8a8-musa}"
-export SGLANG_TORCH_PROFILER_DIR="${SGLANG_TORCH_PROFILER_DIR:-$WORK_DIR/profile}"
+LOG_DIR="${LOG_DIR:-$WORK_DIR/log/${MODEL_NAME}-musa}"
+export SGLANG_TORCH_PROFILER_DIR="${SGLANG_TORCH_PROFILER_DIR:-$WORK_DIR/profile/${MODEL_NAME}}"
 
 # 海光是 --numa-node 4 5 5 7。这里默认留空。
 # 查看本机: numactl -H
 # 个数必须等于 TP_SIZE。例: NUMA_NODES="0 0 1 1"
 NUMA_NODES="${NUMA_NODES:-}"
 
-# 本机 TP=8 实测权重合计，用来判断当前 TP 放不放得下。
-WEIGHT_TOTAL_GIB="${WEIGHT_TOTAL_GIB:-378.08}"
+# 未指定时按模型目录大小估计权重合计，用来判断当前 TP 放不放得下。
 ALLOW_OVERSIZE="${ALLOW_OVERSIZE:-0}"
 
 mkdir -p "$LOG_DIR" "$SGLANG_TORCH_PROFILER_DIR"
@@ -122,14 +189,17 @@ SERVER_LOG="$LOG_DIR/server_$(date +%Y%m%d_%H%M%S).log"
 gpu_count=$(awk -F',' '{print NF}' <<<"$MTHREADS_VISIBLE_DEVICES")
 if [[ "$gpu_count" -ne "$TP_SIZE" ]]; then
   echo "MTHREADS_VISIBLE_DEVICES=$MTHREADS_VISIBLE_DEVICES 共 ${gpu_count} 张卡，TP_SIZE=$TP_SIZE。两者必须相同。" | tee -a "$SERVER_LOG"
-  echo "8 张卡启动: TP_SIZE=${gpu_count} MODEL_PATH=${MODEL_PATH} WORK_DIR=/sgl-workspace/sglang bash $0" | tee -a "$SERVER_LOG"
+  echo "8 张卡启动: TP_SIZE=${gpu_count} bash $0 ${MODEL_NAME}" | tee -a "$SERVER_LOG"
   exit 1
 fi
 
-if [[ ! -d "$MODEL_PATH" ]]; then
-  echo "模型目录不存在: $MODEL_PATH" | tee -a "$SERVER_LOG"
-  echo "容器内应为 /data/models/Qwen3.5-397B-A17B-Channel-FP8-w8a8。" | tee -a "$SERVER_LOG"
-  exit 1
+if [[ -z "${WEIGHT_TOTAL_GIB:-}" ]]; then
+  weight_bytes=$(du -sb "$MODEL_PATH" 2>/dev/null | awk '{print $1}')
+  if [[ -n "${weight_bytes:-}" ]]; then
+    WEIGHT_TOTAL_GIB=$(awk -v bytes="$weight_bytes" 'BEGIN { printf "%.2f", bytes / 1024 / 1024 / 1024 }')
+  else
+    WEIGHT_TOTAL_GIB=0
+  fi
 fi
 
 # 优先读 mthreads-gmi 的总显存；读不到时用本机实测的 76 GiB。
@@ -149,8 +219,10 @@ oversize=$(awk -v need="$need_gib" -v usable="$usable_gib" 'BEGIN { print (need 
   echo "SGLANG_VERSION: $(python3 -c 'import sglang; print(sglang.__version__)' 2>/dev/null || echo unknown)"
   echo "MTHREADS_VISIBLE_DEVICES=$MTHREADS_VISIBLE_DEVICES"
   echo "TP_SIZE=$TP_SIZE"
+  echo "MODEL_NAME=$MODEL_NAME"
   echo "MODEL_PATH=$MODEL_PATH"
   echo "SERVED_MODEL_NAME=$SERVED_MODEL_NAME"
+  echo "LOG_DIR=$LOG_DIR"
   echo "估计每卡权重=${need_gib} GiB，单卡可用约=${usable_gib} GiB"
   echo "GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME:-} TP_SOCKET_IFNAME=${TP_SOCKET_IFNAME:-}"
   echo "SGLANG_ENABLE_SPEC_V2=${SGLANG_ENABLE_SPEC_V2:-}"
@@ -166,12 +238,9 @@ oversize=$(awk -v need="$need_gib" -v usable="$usable_gib" 'BEGIN { print (need 
 
 if [[ "$oversize" == "1" && "$ALLOW_OVERSIZE" != "1" ]]; then
   {
-    echo "已停止。TP=$TP_SIZE 时每卡权重大约 ${need_gib} GiB，单卡可用大约 ${usable_gib} GiB，权重装不下。"
-    echo "海光 BW1100 单卡 144 GiB，所以同一组 TP=4 在海光上可以启动。"
-    echo "摩尔线程这台 8 卡要跑同一组其余参数，请两边都改为:"
-    echo "  TP_SIZE=8 MTHREADS_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 bash $0"
-    echo "海光侧同时把 --tp-size 改成 8，并把 HIP_VISIBLE_DEVICES 改成 8 张卡。"
-    echo "只在摩尔线程改成 8 卡、海光仍是 4 卡时，不要把两边的吞吐直接比较。"
+    echo "已停止。模型 ${MODEL_NAME} 目录约 ${WEIGHT_TOTAL_GIB} GiB，TP=$TP_SIZE 时每卡约 ${need_gib} GiB，单卡可用约 ${usable_gib} GiB。"
+    echo "加大 TP_SIZE，使它等于可见卡数。确认显存足够时用 ALLOW_OVERSIZE=1 bash $0 ${MODEL_NAME}。"
+    echo "海光 BW1100 单卡 144 GiB。两边 TP 不同时，不要把吞吐直接比较。"
   } | tee -a "$SERVER_LOG"
   exit 1
 fi

@@ -2,8 +2,9 @@
 # 摩尔线程容器内，对 start_qwen35_397b_sglang_musa.sh 拉起的服务做压测。
 # 输入长度、并发、输出长度、重复次数与海光脚本一致。
 #
-# 在已经启动服务的同一个容器里另开一个终端执行:
-#   bash bench_qwen35_397b_sglang_musa.sh
+# 在已经启动服务的同一个容器里另开一个终端执行。模型参数与启动脚本相同，日志写到同一目录。
+#   bash bench_qwen35_397b_sglang_musa.sh Qwen3.5-397B-A17B-Channel-FP8-w8a8
+#   bash bench_qwen35_397b_sglang_musa.sh /data/models/Qwen3.5-397B-A17B-FP8
 #
 # 服务地址是启动脚本的 --host 0.0.0.0 --port 31216。
 # --backend sglang 走原生 /generate，不使用海光权重名。
@@ -13,8 +14,79 @@
 set -u
 set -o pipefail
 
-# 与启动脚本的 --served-model-name 一致。--backend sglang 走 /generate，此名称只写入日志。
-MODEL_NAME="${MODEL_NAME:-Qwen3.5-397B-A17B-Channel-FP8-w8a8}"
+MODELS_DIR="${MODELS_DIR:-/data/models}"
+
+usage() {
+  cat <<EOF
+用法: bash $0 <模型目录或模型名>
+
+模型名不含路径时，在 ${MODELS_DIR} 下查找。
+日志默认写到 \$WORK_DIR/log/<模型名>-musa/bench_*.log，与启动脚本相同。
+--backend sglang 走 /generate，模型名写入日志，不发给服务。
+
+示例:
+  bash $0 Qwen3.5-397B-A17B-Channel-FP8-w8a8
+  bash $0 /data/models/Qwen3.5-397B-A17B-FP8
+EOF
+}
+
+MODEL_ARG=""
+if [[ $# -gt 0 ]]; then
+  case "$1" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --model)
+      if [[ $# -lt 2 || -z "${2:-}" ]]; then
+        usage >&2
+        exit 1
+      fi
+      MODEL_ARG="$2"
+      shift 2
+      ;;
+    --model=*)
+      MODEL_ARG="${1#--model=}"
+      shift
+      ;;
+    -*)
+      echo "未知参数: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+    *)
+      MODEL_ARG="$1"
+      shift
+      ;;
+  esac
+fi
+if [[ $# -gt 0 ]]; then
+  echo "多余参数: $*" >&2
+  usage >&2
+  exit 1
+fi
+
+if [[ -n "$MODEL_ARG" ]]; then
+  if [[ "$MODEL_ARG" == /* || "$MODEL_ARG" == */* || -d "$MODEL_ARG" ]]; then
+    MODEL_PATH="$MODEL_ARG"
+  else
+    MODEL_PATH="${MODELS_DIR%/}/$MODEL_ARG"
+  fi
+elif [[ -n "${MODEL_PATH:-}" ]]; then
+  :
+elif [[ -n "${MODEL_NAME:-}" ]]; then
+  MODEL_PATH="${MODELS_DIR%/}/$MODEL_NAME"
+else
+  usage >&2
+  exit 1
+fi
+
+MODEL_NAME="$(basename "${MODEL_PATH%/}")"
+if [[ ! -d "$MODEL_PATH" ]]; then
+  echo "模型目录不存在: $MODEL_PATH" >&2
+  echo "传入 ${MODELS_DIR} 下的目录名，或完整路径。参数与启动脚本相同。" >&2
+  exit 1
+fi
 
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-31216}"
@@ -47,7 +119,7 @@ if [[ -z "${WORK_DIR:-}" ]]; then
     WORK_DIR=/sgl-workspace/sglang
   fi
 fi
-LOG_DIR="${LOG_DIR:-$WORK_DIR/log/Qwen3.5-397B-A17B-Channel-FP8-w8a8-musa}"
+LOG_DIR="${LOG_DIR:-$WORK_DIR/log/${MODEL_NAME}-musa}"
 mkdir -p "$LOG_DIR"
 BENCH_LOG="$LOG_DIR/bench_$(date +%Y%m%d_%H%M%S).log"
 
@@ -67,6 +139,8 @@ FAIL_COUNT=0
   echo "BENCH_START: $(date '+%Y-%m-%d %H:%M:%S')"
   echo "SGLANG_VERSION: $("$PYTHON" -c 'import sglang; print(sglang.__version__)' 2>/dev/null || echo unknown)"
   echo "MODEL_NAME: $MODEL_NAME"
+  echo "MODEL_PATH: $MODEL_PATH"
+  echo "LOG_DIR: $LOG_DIR"
   echo "HOST: $HOST"
   echo "PORT: $PORT"
   echo "DATASET_NAME: $DATASET_NAME"
