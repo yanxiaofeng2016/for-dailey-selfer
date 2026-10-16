@@ -35,8 +35,8 @@
 # 不能照搬、脚本里已改掉的部分:
 #   1. --quantization slimquant_marlin
 #      这是海光镜像的量化后端。摩尔线程镜像没有这个选项，传上去会直接退出。
-#      海光权重是 Channel-FP8-w8a8；本机已加载成功的是 block FP8
-#      （2026-10-14 日志: Detected fp8 checkpoint, quant=fp8）。
+#      默认权重是 /data/models/Qwen3.5-397B-A17B-Channel-FP8-w8a8。
+#      不传 slimquant_marlin，由镜像按 checkpoint 的 quantization_config 识别 FP8。
 #   2. --numa-node 4 5 5 7
 #      这是 BW1100 的 NUMA 拓扑。填错会绑到错误的 CPU。默认不传，按本机 numactl -H 填。
 #   3. HIP_*、HSA_*、ROC_*、USE_DCU_*、SGLANG_USE_LIGHTOP、SGLANG_USE_AITER_LINEAR_ATTN、
@@ -93,14 +93,9 @@ unset HIP_VISIBLE_DEVICES HSA_ENABLE_COREDUMP USE_DCU_CUSTOM_ALLREDUCE \
   SGLANG_KV_LAYOUT_DCU_FA SGLANG_USE_AITER_LINEAR_ATTN SGLANG_USE_FP8_W8A8_MOE \
   NCCL_MIN_NCHANNELS NCCL_MAX_NCHANNELS || true
 
-# 按本机目录修改。当前这台容器的权重在 /data/models，工作目录是 /sgl-workspace/sglang。
-if [[ -z "${MODEL_PATH:-}" ]]; then
-  if [[ -d /data/models/Qwen3.5-397B-A17B-FP8 ]]; then
-    MODEL_PATH=/data/models/Qwen3.5-397B-A17B-FP8
-  else
-    MODEL_PATH=/models/Qwen3.5-397B-A17B-FP8
-  fi
-fi
+# 容器内 Channel-FP8 权重目录。可用 MODEL_PATH 覆盖。
+MODEL_PATH="${MODEL_PATH:-/data/models/Qwen3.5-397B-A17B-Channel-FP8-w8a8}"
+SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-Qwen3.5-397B-A17B-Channel-FP8-w8a8}"
 PORT="${PORT:-31216}"
 if [[ -z "${WORK_DIR:-}" ]]; then
   if [[ -d /lujq ]]; then
@@ -109,7 +104,7 @@ if [[ -z "${WORK_DIR:-}" ]]; then
     WORK_DIR=/sgl-workspace/sglang
   fi
 fi
-LOG_DIR="${LOG_DIR:-$WORK_DIR/log/Qwen3.5-397B-A17B-FP8-musa}"
+LOG_DIR="${LOG_DIR:-$WORK_DIR/log/Qwen3.5-397B-A17B-Channel-FP8-w8a8-musa}"
 export SGLANG_TORCH_PROFILER_DIR="${SGLANG_TORCH_PROFILER_DIR:-$WORK_DIR/profile}"
 
 # 海光是 --numa-node 4 5 5 7。这里默认留空。
@@ -127,13 +122,13 @@ SERVER_LOG="$LOG_DIR/server_$(date +%Y%m%d_%H%M%S).log"
 gpu_count=$(awk -F',' '{print NF}' <<<"$MTHREADS_VISIBLE_DEVICES")
 if [[ "$gpu_count" -ne "$TP_SIZE" ]]; then
   echo "MTHREADS_VISIBLE_DEVICES=$MTHREADS_VISIBLE_DEVICES 共 ${gpu_count} 张卡，TP_SIZE=$TP_SIZE。两者必须相同。" | tee -a "$SERVER_LOG"
-  echo "8 张卡启动: TP_SIZE=${gpu_count} MODEL_PATH=/data/models/Qwen3.5-397B-A17B-FP8 WORK_DIR=/sgl-workspace/sglang bash $0" | tee -a "$SERVER_LOG"
+  echo "8 张卡启动: TP_SIZE=${gpu_count} MODEL_PATH=${MODEL_PATH} WORK_DIR=/sgl-workspace/sglang bash $0" | tee -a "$SERVER_LOG"
   exit 1
 fi
 
 if [[ ! -d "$MODEL_PATH" ]]; then
   echo "模型目录不存在: $MODEL_PATH" | tee -a "$SERVER_LOG"
-  echo "宿主机 /data/models 挂到容器 /models 后，目录应是 /models/Qwen3.5-397B-A17B-FP8。" | tee -a "$SERVER_LOG"
+  echo "容器内应为 /data/models/Qwen3.5-397B-A17B-Channel-FP8-w8a8。" | tee -a "$SERVER_LOG"
   exit 1
 fi
 
@@ -155,6 +150,7 @@ oversize=$(awk -v need="$need_gib" -v usable="$usable_gib" 'BEGIN { print (need 
   echo "MTHREADS_VISIBLE_DEVICES=$MTHREADS_VISIBLE_DEVICES"
   echo "TP_SIZE=$TP_SIZE"
   echo "MODEL_PATH=$MODEL_PATH"
+  echo "SERVED_MODEL_NAME=$SERVED_MODEL_NAME"
   echo "估计每卡权重=${need_gib} GiB，单卡可用约=${usable_gib} GiB"
   echo "GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME:-} TP_SOCKET_IFNAME=${TP_SOCKET_IFNAME:-}"
   echo "SGLANG_ENABLE_SPEC_V2=${SGLANG_ENABLE_SPEC_V2:-}"
@@ -196,6 +192,7 @@ cmd=(
   --speculative-eagle-topk 1
   --speculative-num-draft-tokens 4
   --model-path "$MODEL_PATH"
+  --served-model-name "$SERVED_MODEL_NAME"
   --host 0.0.0.0
   --mem-fraction-static 0.85
   --mamba-scheduler-strategy extra_buffer

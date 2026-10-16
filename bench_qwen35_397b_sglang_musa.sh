@@ -13,8 +13,8 @@
 set -u
 set -o pipefail
 
-# 日志里的模型名。启动脚本没有 --served-model-name，实际权重是 block FP8。
-MODEL_NAME="${MODEL_NAME:-Qwen3.5-397B-A17B-FP8}"
+# 与启动脚本的 --served-model-name 一致。--backend sglang 走 /generate，此名称只写入日志。
+MODEL_NAME="${MODEL_NAME:-Qwen3.5-397B-A17B-Channel-FP8-w8a8}"
 
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-31216}"
@@ -47,7 +47,7 @@ if [[ -z "${WORK_DIR:-}" ]]; then
     WORK_DIR=/sgl-workspace/sglang
   fi
 fi
-LOG_DIR="${LOG_DIR:-$WORK_DIR/log/Qwen3.5-397B-A17B-FP8-musa}"
+LOG_DIR="${LOG_DIR:-$WORK_DIR/log/Qwen3.5-397B-A17B-Channel-FP8-w8a8-musa}"
 mkdir -p "$LOG_DIR"
 BENCH_LOG="$LOG_DIR/bench_$(date +%Y%m%d_%H%M%S).log"
 
